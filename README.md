@@ -101,3 +101,97 @@ The API will return appropriate error responses with descriptive messages when:
 - Results are combined and sorted by similarity score
 - Duplicate results are filtered out by ID
 - Returns the top K most similar results across all queries 
+
+# Chunk Finder Service
+
+A Cloudflare Worker for finding and retrieving chunks of text from embedded documents.
+
+## API Reference
+
+### Find Similar Embeddings
+
+```
+POST /
+```
+
+Finds chunks of text similar to the provided query text.
+
+#### Request Body Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| queries | string or array of strings | The query text to search for similar chunks |
+| collection_id | string | The ID of the collection to search in |
+| topK | number (optional) | Number of results to return, default is 5 |
+| corpus | string (optional) | Filter by corpus (e.g., 'cia', 'frus', 'clinton') |
+| doc_id | string (optional) | Filter by specific document ID |
+| authored_start | string (optional) | Start date for filtering (YYYY-MM-DD format) |
+| authored_end | string (optional) | End date for filtering (YYYY-MM-DD format) |
+
+#### Supported Corpus Values
+
+- `cfpf`: Central Federal Policy Files (1.67M docs)
+- `cia`: CIA documents (440K docs)
+- `frus`: Foreign Relations of the United States (159K docs)
+- `un`: United Nations documents (93K docs)
+- `worldbank`: World Bank reports (68K docs)
+- `clinton`: Clinton administration documents (30K docs)
+- `nato`: NATO documents (23K docs)
+- `cabinet`: U.S. Cabinet meeting records (20K docs)
+- `cpdoc`: Brazilian historical archives (6K docs)
+- `kissinger`: Henry Kissinger's diplomatic work (2K docs)
+- `briefing`: Government briefing documents (924 docs)
+
+#### Example Request
+
+```json
+{
+  "queries": "Cold War diplomacy in Eastern Europe",
+  "collection_id": "history-lab-1",
+  "topK": 10,
+  "corpus": "cia",
+  "authored_start": "1965-01-01",
+  "authored_end": "1975-12-31"
+}
+```
+
+#### Example Response
+
+```json
+{
+  "status": "success",
+  "matches": [
+    {
+      "id": "chunk-123",
+      "text": "The Soviet Union's influence in Eastern Europe remained strong throughout the Cold War period...",
+      "score": 0.92,
+      "metadata": {
+        "corpus": "cia",
+        "doc_id": "doc-456",
+        "authored": 157680000,
+        "title": "Analysis of Eastern Bloc Politics"
+      }
+    },
+    // Additional matches...
+  ]
+}
+```
+
+## Development
+
+### Prerequisites
+
+- Node.js 18 or later
+- Wrangler CLI (`npm install -g wrangler`)
+
+### Setup
+
+1. Clone the repository
+2. Install dependencies: `npm install`
+3. Configure your environment variables in `wrangler.jsonc`
+
+### Deployment
+
+```
+wrangler publish
+``` 

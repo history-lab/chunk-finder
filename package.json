@@ -1,17 +1,20 @@
 {
-  "name": "embedding-generator",
+  "name": "vector-search-worker",
   "version": "1.0.0",
-  "description": "Cloudflare Worker for generating and storing embeddings",
+  "description": "Vector search worker with cluster-based approach",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
   },
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250303.0",
+    "@cloudflare/workers-types": "^4.20231121.0",
     "typescript": "^5.3.3",
-    "wrangler": "^3.32.0"
+    "wrangler": "^3.28.1"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
   }
 }
