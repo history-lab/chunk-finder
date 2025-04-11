@@ -3,8 +3,10 @@ import JSZip from "jszip";
 
 interface Env {
   AI: any;
-  VECTORIZE: any;
   RAMUS_EMBEDDINGS: R2Bucket;
+  DB: D1Database;
+  VECTORIZE_API_TOKEN: string;
+  ACCOUNT_ID: string;
 }
 
 // Define types for Vectorize responses
@@ -13,31 +15,11 @@ interface VectorizeMatch {
   score: number;
   metadata?: Record<string, any>;
   values?: number[];
+  namespace?: string;
 }
 
 interface VectorizeQueryResponse {
   matches: VectorizeMatch[];
-}
-
-// Define types for metadata filtering
-interface AuthoredFilter {
-  $gte?: string | number;
-  $lte?: string | number;
-}
-
-interface MetadataFilter {
-  corpus?: string;
-  doc_id?: string;
-  authored?: AuthoredFilter;
-  collection_id?: string;
-  [key: string]: any;
-}
-
-interface VectorizeQueryOptions {
-  topK: number;
-  filter?: MetadataFilter;
-  returnValues?: boolean;
-  returnMetadata?: 'all' | 'none';
 }
 
 interface ChunkResult {
@@ -58,24 +40,75 @@ interface Chunk {
   score?: number;
 }
 
+// Types for collection indexes from D1
+interface MetadataIndexConfig {
+  propertyName: string;
+  indexType: 'string' | 'number' | 'boolean';
+}
+
+interface CollectionIndexes {
+  collection_id: string;
+  indexes: string[];
+  metadata_indexes: {
+    [indexName: string]: MetadataIndexConfig[];
+  };
+}
+
+// Filter operation types
+// type StringFilterOperator = '$eq' | '$ne' | '$in' | '$nin' | '$lt' | '$lte' | '$gt' | '$gte';
+// type NumberFilterOperator = '$eq' | '$ne' | '$in' | '$nin' | '$lt' | '$lte' | '$gt' | '$gte';
+// type BooleanFilterOperator = '$eq' | '$ne' | '$in' | '$nin';
+
 const MODEL = '@cf/baai/bge-base-en-v1.5';
 const MAX_CONCURRENT_REQUESTS = 6;
 
 export default class extends WorkerEntrypoint<Env> {  
+  /**
+   * Fetch collection indexes information from D1 database
+   * @param collection_id - Collection ID to fetch indexes for
+   * @returns Collection indexes information or null if not found
+   */
+  async getCollectionIndexes(collection_id: string): Promise<CollectionIndexes | null> {
+    try {
+      console.log(`Fetching collection indexes for collection ${collection_id}`);
+      
+      const query = `SELECT collection_id, indexes, metadata_indexes FROM collection_indexes WHERE collection_id = ?`;
+      const result = await this.env.DB.prepare(query).bind(collection_id).first();
+      
+      if (!result) {
+        console.error(`No collection indexes found for collection_id: ${collection_id}`);
+        return null;
+      }
+      
+      // Parse the indexes and metadata_indexes JSON fields
+      const indexes = JSON.parse(result.indexes as string);
+      const metadata_indexes = JSON.parse(result.metadata_indexes as string);
+      
+      console.log(`Found collection indexes:`, indexes);
+      console.log(`Found metadata indexes:`, metadata_indexes);
+      
+      return {
+        collection_id: result.collection_id as string,
+        indexes,
+        metadata_indexes
+      };
+    } catch (error) {
+      console.error(`Error fetching collection indexes:`, error);
+      return null;
+    }
+  }
+  
   async fetch(request: Request) {
     const body = await request.json() as {
       queries: string | string[];
       collection_id: string;
       topK?: number;
-      corpus?: string;
-      doc_id?: string;
-      authored_start?: string;
-      authored_end?: string;
+      filters?: Record<string, any>;
     };
 
     console.log("Received search request:", JSON.stringify(body, null, 2));
     
-    const { queries, collection_id, topK = 5, corpus, doc_id, authored_start, authored_end } = body;
+    const { queries, collection_id, topK = 5, filters } = body;
     
     if (!queries) {
       console.error("Missing required parameter: queries");
@@ -85,126 +118,68 @@ export default class extends WorkerEntrypoint<Env> {
       }), { status: 400 });
     }
     
-    // Validate corpus if provided
-    const validCorpusValues = [
-      'cfpf', 'cia', 'frus', 'un', 'worldbank', 
-      'clinton', 'nato', 'cabinet', 'cpdoc', 
-      'kissinger', 'briefing'
-    ];
+    // Fetch collection indexes from D1
+    const collectionIndexes = await this.getCollectionIndexes(collection_id);
     
-    if (corpus && !validCorpusValues.includes(corpus)) {
-      console.error(`Invalid corpus value: ${corpus}`);
+    if (!collectionIndexes) {
+      console.error(`Collection not found: ${collection_id}`);
       return new Response(JSON.stringify({
         status: 'error',
-        message: `Invalid corpus value: ${corpus}. Valid values are: ${validCorpusValues.join(', ')}`
+        message: `Collection not found: ${collection_id}`
+      }), { status: 404 });
+    }
+    
+    // Validate that the collection has at least one index
+    if (!collectionIndexes.indexes || collectionIndexes.indexes.length === 0) {
+      console.error(`No indexes found for collection: ${collection_id}`);
+      return new Response(JSON.stringify({
+        status: 'error',
+        message: `No indexes found for collection: ${collection_id}`
       }), { status: 400 });
     }
     
-    // Validate and convert date strings if provided
-    let startTimestamp: number | undefined;
-    let endTimestamp: number | undefined;
-    
-    if (authored_start) {
-      const startDate = new Date(authored_start);
-      if (isNaN(startDate.getTime())) {
-        console.error(`Invalid authored_start date: ${authored_start}`);
-        return new Response(JSON.stringify({
-          status: 'error',
-          message: `Invalid authored_start date: ${authored_start}. Please use YYYY-MM-DD format.`
-        }), { status: 400 });
-      }
-      startTimestamp = Math.floor(startDate.getTime()); // Convert to Unix timestamp
-      console.log(`Converted authored_start '${authored_start}' to Unix timestamp: ${startTimestamp}`);
-    }
-    
-    if (authored_end) {
-      const endDate = new Date(authored_end);
-      if (isNaN(endDate.getTime())) {
-        console.error(`Invalid authored_end date: ${authored_end}`);
-        return new Response(JSON.stringify({
-          status: 'error',
-          message: `Invalid authored_end date: ${authored_end}. Please use YYYY-MM-DD format.`
-        }), { status: 400 });
-      }
-      endTimestamp = Math.floor(endDate.getTime()); // Convert to Unix timestamp
-      console.log(`Converted authored_end '${authored_end}' to Unix timestamp: ${endTimestamp}`);
-    }
-    
-    // Create metadata filter object if filtering parameters are provided
-    let metadata;
-    
-    if (corpus || doc_id || startTimestamp || endTimestamp) {
-      const filter: Record<string, any> = {};
-      
-      if (corpus) {
-        filter.corpus = corpus;
-        console.log(`Adding corpus filter: ${corpus}`);
-      }
-      
-      if (doc_id) {
-        filter.doc_id = doc_id;
-        console.log(`Adding doc_id filter: ${doc_id}`);
-      }
-      
-      // Handle authored date range filtering
-      if (startTimestamp || endTimestamp) {
-        filter.authored = {};
-        
-        // In Vectorize metadata filtering, comparison operators must be prefixed with $ 
-        // Example: { "timestamp": { "$gte": 1734242400, "$lt": 1734328800 } }
-        if (startTimestamp) {
-          filter.authored.$gte = startTimestamp;
-          console.log(`Adding authored.$gte filter: ${startTimestamp}`);
-        }
-        
-        if (endTimestamp) {
-          filter.authored.$lte = endTimestamp;
-          console.log(`Adding authored.$lte filter: ${endTimestamp}`);
-        }
-      }
-      
-      metadata = { filter };
-      console.log('Applying metadata filters:', JSON.stringify(metadata, null, 2));
-    } else {
-      console.log('No metadata filters applied');
-    }
-    
     console.log(`Executing vector search with query: ${typeof queries === 'string' ? queries : queries.join(', ')}`);
-    const result = await this.findSimilarEmbeddings(queries, collection_id, topK, metadata);
+    
+    // Process and validate filters if provided
+    let validatedFilters: Record<string, any> = {};
+    
+    if (filters && Object.keys(filters).length > 0) {
+      console.log('Processing provided filters:', JSON.stringify(filters, null, 2));
+      
+      // Process each filter to ensure it has correct operators for its type
+      try {
+        validatedFilters = this.processFilters(filters, collectionIndexes);
+        console.log('Validated filters:', JSON.stringify(validatedFilters, null, 2));
+      } catch (error) {
+        console.error('Error validating filters:', error);
+        return new Response(JSON.stringify({
+          status: 'error',
+          message: error instanceof Error ? error.message : 'Invalid filters provided'
+        }), { status: 400 });
+      }
+    }
+    
+    const result = await this.findSimilarEmbeddings(queries, collection_id, topK, validatedFilters, collectionIndexes);
     console.log(`Search returned ${result?.matches?.length || 0} matches`);
     
     return new Response(JSON.stringify(result));
   }
 
   /**
-   * Find similar embeddings for multiple query terms
+   * Find similar embeddings for multiple query terms across multiple indexes
    * @param queries - Array of query strings to search for
-   * @param collection_id - The vector collection ID to search in
+   * @param collection_id - The collection ID to search in
    * @param topK - Number of similar results to return for each query (default: 5)
-   * @param metadata - Optional metadata filtering parameters
-   * @param metadata.filter - Filter object with the following possible properties:
-   * @param metadata.filter.corpus - Optional filter for specific corpus (e.g., 'cia', 'frus', 'clinton')
-   * @param metadata.filter.doc_id - Optional filter for specific document ID
-   * @param metadata.filter.authored - Optional date range filter for document authored date
-   * @param metadata.filter.authored.$gte - Optional greater than or equal to timestamp (using "$gte" operator)
-   * @param metadata.filter.authored.$lte - Optional less than or equal to timestamp (using "$lte" operator)
+   * @param filters - Optional metadata filtering parameters
+   * @param collectionIndexes - Collection indexes information
    * @returns Array of matching results with metadata, sorted by similarity score
    */
   async findSimilarEmbeddings(
     queries: string | string[],
     collection_id: string,
     topK: number = 5,
-    metadata?: { 
-      filter?: {
-        corpus?: string;
-        doc_id?: string;
-        authored?: {
-          $gte?: string | number;
-          $lte?: string | number;
-        };
-        [key: string]: any;
-      }
-    }
+    filters?: Record<string, any>,
+    collectionIndexes?: CollectionIndexes
   ) {
     try {
       // Convert input to array if it's a single string
@@ -212,9 +187,25 @@ export default class extends WorkerEntrypoint<Env> {
       console.log(`Finding similar embeddings for ${queryArray.length} queries in collection ${collection_id}`);
 
       // Log metadata filters if present
-      if (metadata?.filter) {
-        console.log('Using metadata filters:', JSON.stringify(metadata.filter, null, 2));
+      if (filters) {
+        console.log('Using metadata filters:', JSON.stringify(filters, null, 2));
       }
+
+      // Make sure we have valid collection indexes
+      if (!collectionIndexes) {
+        const fetchedIndexes = await this.getCollectionIndexes(collection_id);
+        if (!fetchedIndexes) {
+          throw new Error(`Collection not found: ${collection_id}`);
+        }
+        collectionIndexes = fetchedIndexes;
+      }
+
+      // Validate that the collection has at least one index
+      if (!collectionIndexes.indexes || collectionIndexes.indexes.length === 0) {
+        throw new Error(`No indexes found for collection: ${collection_id}`);
+      }
+
+      console.log(`Collection has ${collectionIndexes.indexes.length} indexes:`, collectionIndexes.indexes);
 
       // Generate embeddings for all queries in parallel
       let queryEmbeddings;
@@ -228,199 +219,221 @@ export default class extends WorkerEntrypoint<Env> {
         };
       }
 
-      console.log("queryEmbeddings", queryEmbeddings);
+      console.log("Generated query embeddings");
 
-      // Query Vectorize for similar vectors for each embedding in parallel
-      const searchPromises = queryEmbeddings.data.map(async (embedding: number[], i: number) => {
-        console.log(`Querying collection ${collection_id} with embedding for "${queryArray[i]}" (truncated)`);
-        
-        try {
-          // Prepare Vectorize query options with filters
-          const queryOptions: VectorizeQueryOptions = {
-            topK: metadata ? 10 : topK, // Get more results when filtering to ensure we have enough after filtering
-            filter: { collection_id: collection_id },
-            returnValues: false,
-            returnMetadata: 'all',
-          };
+      // For each query embedding, search across all indexes in parallel
+      const allSearchResults: Chunk[][] = [];
 
-          // Add metadata filters if present
-          if (metadata?.filter) {
-            // Merge the user-provided filters with the collection_id filter
-            queryOptions.filter = {
-              ...queryOptions.filter,
-              ...metadata.filter
+      for (let i = 0; i < queryEmbeddings.data.length; i++) {
+        const embedding = queryEmbeddings.data[i];
+        console.log(`Processing query: "${queryArray[i]}" (truncated)`);
+
+        // Calculate how many results to fetch from each index
+        // We need to ensure we get enough results even after filtering
+        const fetchCount = Math.min(Math.max(topK * 2, 10), 20);
+        console.log(`Fetching top ${fetchCount} results from each index`);
+
+        // Query each index in parallel and collect the results
+        const indexSearchPromises = collectionIndexes.indexes.map(async (indexName) => {
+          try {
+            console.log(`Querying index: ${indexName}`);
+
+            // Prepare query options for this index
+            const queryOptions: {
+              topK: number;
+              namespace: string;
+              returnValues: boolean;
+              returnMetadata: 'all' | 'none' | 'indexed';
+              filter?: Record<string, any>;
+            } = {
+              topK: fetchCount,
+              namespace: collection_id, // Use collection_id as namespace
+              returnValues: false,
+              returnMetadata: 'all',
             };
-          }
 
-          console.log('Using query options:', JSON.stringify(queryOptions, null, 2));
-
-          // Query the vector database
-          let vectorMatches = await this.env.VECTORIZE.query(embedding, queryOptions) as VectorizeQueryResponse;
-
-          console.log("Vector matches", vectorMatches);        
-
-          // Check if matches is undefined or doesn't have the expected structure
-          if (!vectorMatches || !Array.isArray(vectorMatches.matches) || vectorMatches.matches.length === 0) {
-            console.error(`Invalid or empty response from Vectorize for query "${queryArray[i]}":`, vectorMatches);
-            return [] as Chunk[];
-          }
-
-          // Construct R2 keys for the matching vectors using the correct structure
-          const r2KeysWithMetadata = vectorMatches.matches.map(match => {
-            if (!match.metadata || !match.metadata.user_id || !match.metadata.file_id || !match.id) {
-              console.error("Missing metadata fields in match:", match);
-              return null;
-            }
-          
-            // Construct R2 key using the metadata fields
-            // Format: userId/collectionId/fileId/batchId.zip
-            const userId = match.metadata.user_id;
-            const fileId = match.metadata.file_id;
-            const batchId = match.id;
-            
-            return {
-              key: `${userId}/${collection_id}/${fileId}/${batchId}.zip`,
-              metadata: match.metadata,
-              score: match.score,
-              id: match.id
-            };
-          }).filter(item => item !== null);
-
-          if (r2KeysWithMetadata.length === 0) {
-            console.error("No valid R2 keys could be constructed");
-            return [] as Chunk[];
-          }
-          
-          const r2Keys = r2KeysWithMetadata.map(item => item.key);
-
-          console.log("Fetching chunks with keys:", r2Keys);
-
-          // Fetch chunks from R2 bucket with concurrency limit
-          const chunkResults = await this.fetchChunksFromR2(r2Keys);
-          
-          if (!chunkResults || chunkResults.length === 0) {
-            console.error("No chunks returned from R2");
-            return [] as Chunk[];
-          }
-
-          // Process the chunks - extract them from the ZIP files and calculate similarity
-          const allProcessedChunks: Chunk[] = [];
-
-          for (let i = 0; i < chunkResults.length; i++) {
-            const result = chunkResults[i];
-            const keyWithMetadata = r2KeysWithMetadata.find(item => item.key === result.key);
-            
-            if (!keyWithMetadata) {
-              console.error(`Could not find metadata for key ${result.key}`);
-              continue;
-            }
-            
-            if (result.status !== 200 || !result.data) {
-              console.error(`Error fetching chunk ${result.key}: ${result.error || 'Unknown error'}`);
-              continue;
+            // Add filters if present
+            if (filters && Object.keys(filters).length > 0) {
+              queryOptions.filter = filters;
             }
 
-            try {
-              // Convert base64 to array buffer
-              const binaryData = atob(result.data);
-              const bytes = new Uint8Array(binaryData.length);
-              for (let i = 0; i < binaryData.length; i++) {
-                bytes[i] = binaryData.charCodeAt(i);
+            // Query the Vectorize API for this index
+            const vectorMatches = await this.queryVectorizeAPI(indexName, embedding, queryOptions);
+
+            if (!vectorMatches || !Array.isArray(vectorMatches.matches) || vectorMatches.matches.length === 0) {
+              console.log(`No matches found in index ${indexName} for query "${queryArray[i]}"`);
+              return [] as Chunk[];
+            }
+
+            console.log(`Found ${vectorMatches.matches.length} matches in index ${indexName}`);
+
+            // Construct R2 keys for the matching vectors
+            const r2KeysWithMetadata = vectorMatches.matches.map(match => {
+              if (!match.metadata || !match.metadata.user_id || !match.metadata.file_id || !match.id) {
+                console.error("Missing metadata fields in match:", match);
+                return null;
               }
+            
+              // Construct R2 key using the metadata fields
+              // Format: userId/collectionId/fileId/batchId.zip
+              const userId = match.metadata.user_id;
+              const fileId = match.metadata.file_id;
+              const batchId = match.id;
+              
+              return {
+                key: `${userId}/${collection_id}/${fileId}/${batchId}.zip`,
+                metadata: match.metadata,
+                score: match.score,
+                id: match.id
+              };
+            }).filter(item => item !== null);
 
-              // Use JSZip to extract the data
-              const zip = await JSZip.loadAsync(bytes);
+            if (r2KeysWithMetadata.length === 0) {
+              console.error("No valid R2 keys could be constructed");
+              return [] as Chunk[];
+            }
+            
+            const r2Keys = r2KeysWithMetadata.map(item => item.key);
+            console.log(`Fetching ${r2Keys.length} chunks from R2 for index ${indexName}`);
+
+            // Fetch chunks from R2 bucket with concurrency limit
+            const chunkResults = await this.fetchChunksFromR2(r2Keys);
+            
+            if (!chunkResults || chunkResults.length === 0) {
+              console.error(`No chunks returned from R2 for index ${indexName}`);
+              return [] as Chunk[];
+            }
+
+            // Process the chunks - extract them from the ZIP files and calculate similarity
+            const processedChunks: Chunk[] = [];
+
+            for (let i = 0; i < chunkResults.length; i++) {
+              const result = chunkResults[i];
+              const keyWithMetadata = r2KeysWithMetadata.find(item => item.key === result.key);
               
-              // No need to extract metadata.json anymore as we're using the cluster metadata
-              
-              // Extract embeddings binary data and convert to Float32Array
-              const embeddingsFile = zip.file("embeddings.bin");
-              if (!embeddingsFile) {
-                console.error("Missing embeddings.bin in ZIP");
+              if (!keyWithMetadata) {
+                console.error(`Could not find metadata for key ${result.key}`);
                 continue;
               }
-              const embeddingsArrayBuffer = await embeddingsFile.async("arraybuffer");
-              const embeddings = new Float32Array(embeddingsArrayBuffer);
               
-              // Extract chunks
-              const chunksFile = zip.file("chunks.json");
-              if (!chunksFile) {
-                console.error("Missing chunks.json in ZIP");
+              if (result.status !== 200 || !result.data) {
+                console.error(`Error fetching chunk ${result.key}: ${result.error || 'Unknown error'}`);
                 continue;
               }
-              const chunksText = await chunksFile.async("text");
-              const chunks = JSON.parse(chunksText) as Chunk[];
-              
-              // Try to determine batch size either from metadata or chunks length
-              let batchSize = chunks.length;
-              let fileMetadata = null;
-              
-              // We'll still try to read metadata.json if available just to get batch_size,
-              // but we won't use it for the actual metadata
+
               try {
-                const metadataFile = zip.file("metadata.json");
-                if (metadataFile) {
-                  const metadataText = await metadataFile.async("text");
-                  fileMetadata = JSON.parse(metadataText);
-                  if (fileMetadata.batch_size) {
-                    batchSize = fileMetadata.batch_size;
-                  }
+                // Convert base64 to array buffer
+                const binaryData = atob(result.data);
+                const bytes = new Uint8Array(binaryData.length);
+                for (let i = 0; i < binaryData.length; i++) {
+                  bytes[i] = binaryData.charCodeAt(i);
                 }
-              } catch (e) {
-                console.warn("Could not read metadata.json, using chunks length as batch size", e);
-              }
-              
-              // Calculate the number of embeddings and dimensions
-              const embeddingDimensions = embeddings.length / batchSize;
-              
-              // Process each chunk with its corresponding embedding
-              for (let j = 0; j < chunks.length; j++) {
-                const chunk = chunks[j];
+
+                // Use JSZip to extract the data
+                const zip = await JSZip.loadAsync(bytes);
                 
-                // Extract the embedding for this chunk from the Float32Array
-                const startIdx = j * embeddingDimensions;
-                const chunkEmbedding = Array.from(
-                  embeddings.subarray(startIdx, startIdx + embeddingDimensions)
-                );
+                // Extract embeddings binary data and convert to Float32Array
+                const embeddingsFile = zip.file("embeddings.bin");
+                if (!embeddingsFile) {
+                  console.error("Missing embeddings.bin in ZIP");
+                  continue;
+                }
+                const embeddingsArrayBuffer = await embeddingsFile.async("arraybuffer");
+                const embeddings = new Float32Array(embeddingsArrayBuffer);
                 
-                // Calculate cosine similarity
-                const similarity = this.cosineSimilarity(embedding, chunkEmbedding);
+                // Extract chunks
+                const chunksFile = zip.file("chunks.json");
+                if (!chunksFile) {
+                  console.error("Missing chunks.json in ZIP");
+                  continue;
+                }
+                const chunksText = await chunksFile.async("text");
+                const chunks = JSON.parse(chunksText) as Chunk[];
                 
-                // Add embedding, score, and cluster metadata to the chunk
-                const processedChunk: Chunk = {
-                  ...chunk,
-                  embedding: chunkEmbedding,
-                  score: similarity,
-                  metadata: {
-                    ...keyWithMetadata.metadata,
-                    cluster_id: keyWithMetadata.id,
-                    cluster_score: keyWithMetadata.score
+                // Try to determine batch size either from metadata or chunks length
+                let batchSize = chunks.length;
+                let fileMetadata = null;
+                
+                try {
+                  const metadataFile = zip.file("metadata.json");
+                  if (metadataFile) {
+                    const metadataText = await metadataFile.async("text");
+                    fileMetadata = JSON.parse(metadataText);
+                    if (fileMetadata.batch_size) {
+                      batchSize = fileMetadata.batch_size;
+                    }
                   }
-                };
+                } catch (e) {
+                  console.warn("Could not read metadata.json, using chunks length as batch size", e);
+                }
                 
-                allProcessedChunks.push(processedChunk);
+                // Calculate the number of embeddings and dimensions
+                const embeddingDimensions = embeddings.length / batchSize;
+                
+                // Process each chunk with its corresponding embedding
+                for (let j = 0; j < chunks.length; j++) {
+                  const chunk = chunks[j];
+                  
+                  // Extract the embedding for this chunk from the Float32Array
+                  const startIdx = j * embeddingDimensions;
+                  const chunkEmbedding = Array.from(
+                    embeddings.subarray(startIdx, startIdx + embeddingDimensions)
+                  );
+                  
+                  // Calculate cosine similarity
+                  const similarity = this.cosineSimilarity(embedding, chunkEmbedding);
+                  
+                  // Add embedding, score, and cluster metadata to the chunk
+                  const processedChunk: Chunk = {
+                    ...chunk,
+                    embedding: chunkEmbedding,
+                    score: similarity,
+                    metadata: {
+                      ...keyWithMetadata.metadata,
+                      cluster_id: keyWithMetadata.id,
+                      cluster_score: keyWithMetadata.score,
+                      index_name: indexName // Add the index name to the metadata
+                    }
+                  };
+                  
+                  processedChunks.push(processedChunk);
+                }
+              } catch (error) {
+                console.error(`Error processing chunk ${result.key}:`, error);
               }
-            } catch (error) {
-              console.error(`Error processing chunk ${result.key}:`, error);
             }
+
+            console.log(`Processed ${processedChunks.length} chunks from index ${indexName}`);
+            
+            // Sort chunks by similarity score and return
+            processedChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
+            return processedChunks;
+            
+          } catch (error) {
+            console.error(`Error searching index ${indexName}:`, error);
+            return [] as Chunk[];
           }
+        });
 
-          // Sort chunks by similarity score and take the top K
-          allProcessedChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
-          return allProcessedChunks.slice(0, topK);
-          
-        } catch (error) {
-          console.error(`Error querying collection with query "${queryArray[i]}":`, error);
-          return [] as Chunk[];
-        }
-      });
+        // Wait for all index searches to complete
+        const indexResults = await Promise.all(indexSearchPromises);
+        
+        // Combine results from all indexes
+        const combinedResults = indexResults.flat();
+        console.log(`Combined ${combinedResults.length} results from all indexes`);
+        
+        // Sort by similarity score
+        combinedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+        
+        // Take the top K
+        const topResults = combinedResults.slice(0, topK);
+        console.log(`Returning top ${topResults.length} results`);
+        
+        allSearchResults.push(topResults);
+      }
 
-      // Wait for all search queries to complete
-      const searchResults = await Promise.all(searchPromises);
-      
-      // Flatten results and sort by similarity score (descending)
-      const allChunks = searchResults.flat() as Chunk[];
-      allChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
+      // Combine results from all queries
+      const allChunks = allSearchResults.flat();
       
       // Take the top K unique results (by ID)
       const seenIds = new Set<string>();
@@ -567,5 +580,244 @@ export default class extends WorkerEntrypoint<Env> {
     }
     
     return dotProduct / (normA * normB);
+  }
+
+  /**
+   * Query the Vectorize API directly
+   * @param indexName - Name of the index to query
+   * @param vector - Vector embedding to search with
+   * @param options - Query options
+   * @returns Vectorize query response
+   */
+  async queryVectorizeAPI(
+    indexName: string, 
+    vector: number[], 
+    options: {
+      topK?: number;
+      filter?: Record<string, any>;
+      namespace?: string;
+      returnValues?: boolean;
+      returnMetadata?: 'all' | 'none' | 'indexed';
+    }
+  ): Promise<VectorizeQueryResponse> {
+    try {
+      console.log(`Querying Vectorize API index ${indexName} with options:`, JSON.stringify(options, null, 2));
+      
+      const url = `https://api.cloudflare.com/client/v4/accounts/${this.env.ACCOUNT_ID}/vectorize/v2/indexes/${indexName}/query`;
+      
+      const requestBody: {
+        vector: number[];
+        topK: number;
+        returnValues: boolean;
+        returnMetadata: 'all' | 'none' | 'indexed';
+        namespace?: string;
+        filter?: Record<string, any>;
+      } = {
+        vector,
+        topK: options.topK || 5,
+        returnValues: options.returnValues || false,
+        returnMetadata: options.returnMetadata || 'all',
+      };
+      
+      // Add namespace if provided
+      if (options.namespace) {
+        requestBody.namespace = options.namespace;
+      }
+      
+      // Add filter if provided
+      if (options.filter && Object.keys(options.filter).length > 0) {
+        requestBody.filter = options.filter;
+      }
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.env.VECTORIZE_API_TOKEN}`
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`Vectorize API error (${response.status}):`, errorText);
+        throw new Error(`Vectorize API error: ${response.status}`);
+      }
+      
+      interface VectorizeAPIResponse {
+        success: boolean;
+        errors?: any[];
+        result: {
+          matches: VectorizeMatch[];
+        };
+      }
+      
+      const responseData = await response.json() as VectorizeAPIResponse;
+      
+      if (!responseData.success) {
+        console.error('Vectorize API returned error:', responseData.errors);
+        throw new Error(`Vectorize API returned error: ${JSON.stringify(responseData.errors)}`);
+      }
+      
+      console.log(`Vectorize API returned ${responseData.result.matches?.length || 0} matches`);
+      
+      return {
+        matches: responseData.result.matches || []
+      };
+    } catch (error) {
+      console.error(`Error querying Vectorize API:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Process filters and validate them against the collection indexes
+   * @param filters - Filters to process
+   * @param collectionIndexes - Collection indexes information
+   * @returns Validated filters object with proper type conversions and operators
+   */
+  processFilters(filters: Record<string, any>, collectionIndexes: CollectionIndexes): Record<string, any> {
+    const validatedFilters: Record<string, any> = {};
+    
+    // Flatten metadata indexes from all collection indexes to make lookup easier
+    const metadataIndexMap: Record<string, MetadataIndexConfig> = {};
+    
+    // Process all indexes in the collection
+    for (const indexName of collectionIndexes.indexes) {
+      // Get metadata indexes for this index
+      const indexMetadataConfigs = collectionIndexes.metadata_indexes[indexName] || [];
+      
+      // Add each metadata index to the map
+      for (const config of indexMetadataConfigs) {
+        metadataIndexMap[config.propertyName] = config;
+      }
+    }
+    
+    console.log('Available metadata indexes:', Object.keys(metadataIndexMap));
+    
+    // Process each filter key-value pair
+    for (const [key, value] of Object.entries(filters)) {
+      // Skip if there's no metadata index config for this key
+      if (!metadataIndexMap[key]) {
+        console.warn(`Skipping filter for '${key}' as it has no metadata index configuration`);
+        continue;
+      }
+      
+      const indexConfig = metadataIndexMap[key];
+      console.log(`Processing filter for '${key}' with type '${indexConfig.indexType}'`);
+      
+      // Process based on the filter's structure and metadata index type
+      if (typeof value === 'object' && value !== null) {
+        // This is a complex filter with operators
+        const processedFilter: Record<string, any> = {};
+        
+        for (const [op, opValue] of Object.entries(value)) {
+          // Validate operator based on metadata index type
+          if (indexConfig.indexType === 'string') {
+            // String type supports all operators
+            if (['$eq', '$ne', '$in', '$nin', '$lt', '$lte', '$gt', '$gte'].includes(op)) {
+              processedFilter[op] = opValue;
+            } else {
+              console.warn(`Skipping invalid operator '${op}' for string type`);
+            }
+          } else if (indexConfig.indexType === 'number') {
+            // Number type supports all operators
+            if (['$eq', '$ne', '$in', '$nin', '$lt', '$lte', '$gt', '$gte'].includes(op)) {
+              // Convert to number if necessary
+              if (typeof opValue === 'string') {
+                const numValue = Number(opValue);
+                if (!isNaN(numValue)) {
+                  processedFilter[op] = numValue;
+                } else {
+                  console.warn(`Skipping invalid number value '${opValue}' for operator '${op}'`);
+                }
+              } else if (Array.isArray(opValue) && ['$in', '$nin'].includes(op)) {
+                // Convert array values to numbers if necessary
+                const numArray = opValue.map(v => typeof v === 'string' ? Number(v) : v)
+                  .filter(v => typeof v === 'number' && !isNaN(v));
+                processedFilter[op] = numArray;
+              } else {
+                processedFilter[op] = opValue;
+              }
+            } else {
+              console.warn(`Skipping invalid operator '${op}' for number type`);
+            }
+          } else if (indexConfig.indexType === 'boolean') {
+            // Boolean type supports only $eq, $ne, $in, $nin
+            if (['$eq', '$ne', '$in', '$nin'].includes(op)) {
+              // Convert to boolean if necessary
+              if (typeof opValue === 'string') {
+                if (opValue === 'true') {
+                  processedFilter[op] = true;
+                } else if (opValue === 'false') {
+                  processedFilter[op] = false;
+                } else {
+                  console.warn(`Skipping invalid boolean value '${opValue}' for operator '${op}'`);
+                }
+              } else if (Array.isArray(opValue) && ['$in', '$nin'].includes(op)) {
+                // Convert array values to booleans if necessary
+                const boolArray = opValue.map(v => {
+                  if (typeof v === 'string') {
+                    return v === 'true' ? true : v === 'false' ? false : null;
+                  }
+                  return typeof v === 'boolean' ? v : null;
+                }).filter(v => v !== null);
+                processedFilter[op] = boolArray;
+              } else {
+                processedFilter[op] = opValue;
+              }
+            } else {
+              console.warn(`Skipping invalid operator '${op}' for boolean type`);
+            }
+          }
+        }
+        
+        if (Object.keys(processedFilter).length > 0) {
+          validatedFilters[key] = processedFilter;
+        }
+      } else {
+        // This is a simple filter with implicit $eq
+        if (indexConfig.indexType === 'string') {
+          // String type
+          if (typeof value === 'string') {
+            validatedFilters[key] = value;
+          } else {
+            validatedFilters[key] = { '$eq': String(value) };
+          }
+        } else if (indexConfig.indexType === 'number') {
+          // Number type
+          if (typeof value === 'number') {
+            validatedFilters[key] = value;
+          } else if (typeof value === 'string') {
+            const numValue = Number(value);
+            if (!isNaN(numValue)) {
+              validatedFilters[key] = numValue;
+            } else {
+              console.warn(`Skipping invalid number value '${value}' for key '${key}'`);
+            }
+          } else {
+            console.warn(`Skipping non-numeric value for key '${key}'`);
+          }
+        } else if (indexConfig.indexType === 'boolean') {
+          // Boolean type
+          if (typeof value === 'boolean') {
+            validatedFilters[key] = value;
+          } else if (typeof value === 'string') {
+            if (value === 'true') {
+              validatedFilters[key] = true;
+            } else if (value === 'false') {
+              validatedFilters[key] = false;
+            } else {
+              console.warn(`Skipping invalid boolean value '${value}' for key '${key}'`);
+            }
+          } else {
+            console.warn(`Skipping non-boolean value for key '${key}'`);
+          }
+        }
+      }
+    }
+    
+    console.log('Validated filters:', validatedFilters);
+    return validatedFilters;
   }
 }

@@ -1,15 +1,16 @@
 {
-  "name": "vector-search-worker",
+  "name": "vector-search-worker-2",
   "main": "src/index.ts",
   "compatibility_date": "2025-02-11",
   "compatibility_flags": ["nodejs_compat"],
   "ai": {
     "binding": "AI"
   },
-  "vectorize": [
+  "d1_databases": [
     {
-      "binding": "VECTORIZE",
-      "index_name": "history-lab-1"
+      "binding": "DB",
+      "database_name": "ramus-db",
+      "database_id": "43ddebd9-80de-40fb-9544-dd84927bf64d"
     }
   ],
   "r2_buckets": [
