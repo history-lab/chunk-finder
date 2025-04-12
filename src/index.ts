@@ -7,6 +7,7 @@ interface Env {
   DB: D1Database;
   VECTORIZE_API_TOKEN: string;
   ACCOUNT_ID: string;
+  COLLECTIONS_METADATA: KVNamespace;
 }
 
 // Define types for Vectorize responses
@@ -61,39 +62,38 @@ interface CollectionIndexes {
 
 const MODEL = '@cf/baai/bge-base-en-v1.5';
 const MAX_CONCURRENT_REQUESTS = 6;
+const USE_NAMESPACE_FOR_COLLECTION = false; // Set to false to use collection_id as a metadata field instead of namespace
 
 export default class extends WorkerEntrypoint<Env> {  
   /**
-   * Fetch collection indexes information from D1 database
+   * Fetch collection indexes information from KV store
    * @param collection_id - Collection ID to fetch indexes for
    * @returns Collection indexes information or null if not found
    */
   async getCollectionIndexes(collection_id: string): Promise<CollectionIndexes | null> {
     try {
-      console.log(`Fetching collection indexes for collection ${collection_id}`);
+      console.log(`Fetching collection indexes for collection ${collection_id} from KV`);
       
-      const query = `SELECT collection_id, indexes, metadata_indexes FROM collection_indexes WHERE collection_id = ?`;
-      const result = await this.env.DB.prepare(query).bind(collection_id).first();
+      // Fetch the collection metadata from KV using the collection_id as the key
+      const collectionData = await this.env.COLLECTIONS_METADATA.get(collection_id);
       
-      if (!result) {
-        console.error(`No collection indexes found for collection_id: ${collection_id}`);
+      if (!collectionData) {
+        console.error(`No collection found in KV for collection_id: ${collection_id}`);
         return null;
       }
       
-      // Parse the indexes and metadata_indexes JSON fields
-      const indexes = JSON.parse(result.indexes as string);
-      const metadata_indexes = JSON.parse(result.metadata_indexes as string);
+      // Parse the KV data
+      const parsedData = JSON.parse(collectionData);
+      console.log(`Found collection in KV:`, parsedData);
       
-      console.log(`Found collection indexes:`, indexes);
-      console.log(`Found metadata indexes:`, metadata_indexes);
-      
+      // Map the KV data structure to the CollectionIndexes interface
       return {
-        collection_id: result.collection_id as string,
-        indexes,
-        metadata_indexes
+        collection_id: collection_id,
+        indexes: parsedData.indexes || [],
+        metadata_indexes: parsedData.metadataIndexes || {}
       };
     } catch (error) {
-      console.error(`Error fetching collection indexes:`, error);
+      console.error(`Error fetching collection indexes from KV:`, error);
       return null;
     }
   }
@@ -241,20 +241,38 @@ export default class extends WorkerEntrypoint<Env> {
             // Prepare query options for this index
             const queryOptions: {
               topK: number;
-              namespace: string;
+              namespace?: string;
               returnValues: boolean;
               returnMetadata: 'all' | 'none' | 'indexed';
               filter?: Record<string, any>;
             } = {
               topK: fetchCount,
-              namespace: collection_id, // Use collection_id as namespace
               returnValues: false,
               returnMetadata: 'all',
             };
 
+            // Apply collection filtering based on configuration
+            if (USE_NAMESPACE_FOR_COLLECTION) {
+              // Use namespace for collection filtering
+              queryOptions.namespace = collection_id;
+              console.log(`Using namespace for collection filtering: ${collection_id}`);
+            } else {
+              // Use metadata field for collection filtering
+              queryOptions.filter = { collection_id: collection_id };
+              console.log(`Using metadata field for collection filtering: ${collection_id}`);
+            }
+
             // Add filters if present
             if (filters && Object.keys(filters).length > 0) {
-              queryOptions.filter = filters;
+              // If we're already using filter for collection_id, merge with user filters
+              if (queryOptions.filter) {
+                queryOptions.filter = {
+                  ...queryOptions.filter,
+                  ...filters
+                };
+              } else {
+                queryOptions.filter = filters;
+              }
             }
 
             // Query the Vectorize API for this index
@@ -277,11 +295,13 @@ export default class extends WorkerEntrypoint<Env> {
               // Construct R2 key using the metadata fields
               // Format: userId/collectionId/fileId/batchId.zip
               const userId = match.metadata.user_id;
+              // Get collection_id from metadata if using metadata field approach, or use the parameter if using namespace
+              const collId = USE_NAMESPACE_FOR_COLLECTION ? collection_id : match.metadata.collection_id || collection_id;
               const fileId = match.metadata.file_id;
               const batchId = match.id;
               
               return {
-                key: `${userId}/${collection_id}/${fileId}/${batchId}.zip`,
+                key: `${userId}/${collId}/${fileId}/${batchId}.zip`,
                 metadata: match.metadata,
                 score: match.score,
                 id: match.id
@@ -697,6 +717,13 @@ export default class extends WorkerEntrypoint<Env> {
     
     // Process each filter key-value pair
     for (const [key, value] of Object.entries(filters)) {
+      // Special case for collection_id when not using namespace
+      if (key === 'collection_id' && !USE_NAMESPACE_FOR_COLLECTION) {
+        // Always add collection_id filter directly without validation
+        validatedFilters[key] = value;
+        continue;
+      }
+      
       // Skip if there's no metadata index config for this key
       if (!metadataIndexMap[key]) {
         console.warn(`Skipping filter for '${key}' as it has no metadata index configuration`);

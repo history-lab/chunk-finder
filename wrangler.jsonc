@@ -20,6 +20,13 @@
       "preview_bucket_name": "ramus-embeddings-preview"
     }
   ],
+  "kv_namespaces": [
+    {
+      "binding": "COLLECTIONS_METADATA",
+      "id": "301664cae3cf4c168644c16fbba05777",
+      "preview_id": "301664cae3cf4c168644c16fbba05777"
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
