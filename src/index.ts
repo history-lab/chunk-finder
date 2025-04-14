@@ -431,7 +431,8 @@ export default class extends WorkerEntrypoint<Env> {
             
           } catch (error) {
             console.error(`Error searching index ${indexName}:`, error);
-            return [] as Chunk[];
+            // Re-throw the error to propagate it up
+            throw error;
           }
         });
 
