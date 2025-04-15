@@ -6,13 +6,6 @@
   "ai": {
     "binding": "AI"
   },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "ramus-db",
-      "database_id": "43ddebd9-80de-40fb-9544-dd84927bf64d"
-    }
-  ],
   "r2_buckets": [
     {
       "binding": "RAMUS_EMBEDDINGS",

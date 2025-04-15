@@ -4,7 +4,6 @@ import JSZip from "jszip";
 interface Env {
   AI: any;
   RAMUS_EMBEDDINGS: R2Bucket;
-  DB: D1Database;
   VECTORIZE_API_TOKEN: string;
   ACCOUNT_ID: string;
   COLLECTIONS_METADATA: KVNamespace;
