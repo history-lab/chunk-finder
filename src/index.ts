@@ -7,6 +7,7 @@ interface Env {
   VECTORIZE_API_TOKEN: string;
   ACCOUNT_ID: string;
   COLLECTIONS_METADATA: KVNamespace;
+  FILES_METADATA: KVNamespace;
 }
 
 // Define types for Vectorize responses
@@ -61,7 +62,14 @@ interface CollectionIndexes {
 
 const MODEL = '@cf/baai/bge-base-en-v1.5';
 const MAX_CONCURRENT_REQUESTS = 6;
-const USE_NAMESPACE_FOR_COLLECTION = false; // Set to false to use collection_id as a metadata field instead of namespace
+const USE_NAMESPACE_FOR_COLLECTION = true; // Set to false to use collection_id as a metadata field instead of namespace
+
+// Type for index search result including errors
+interface IndexSearchResult {
+  indexName: string;
+  chunks: Chunk[];
+  error?: string;
+}
 
 export default class extends WorkerEntrypoint<Env> {  
   /**
@@ -117,7 +125,7 @@ export default class extends WorkerEntrypoint<Env> {
       }), { status: 400 });
     }
     
-    // Fetch collection indexes from D1
+    // Fetch collection indexes from KV using the provided collection_id
     const collectionIndexes = await this.getCollectionIndexes(collection_id);
     
     if (!collectionIndexes) {
@@ -158,8 +166,10 @@ export default class extends WorkerEntrypoint<Env> {
       }
     }
     
+    // Execute the similarity search using the provided collection_id
     const result = await this.findSimilarEmbeddings(queries, collection_id, topK, validatedFilters, collectionIndexes);
-    console.log(`Search returned ${result?.matches?.length || 0} matches`);
+    
+    console.log(`Search returned ${result?.documents?.length || 0} documents with a total of ${result?.total_chunks || 0} chunks`);
     
     return new Response(JSON.stringify(result));
   }
@@ -189,7 +199,7 @@ export default class extends WorkerEntrypoint<Env> {
       if (filters) {
         console.log('Using metadata filters:', JSON.stringify(filters, null, 2));
       }
-
+      
       // Make sure we have valid collection indexes
       if (!collectionIndexes) {
         const fetchedIndexes = await this.getCollectionIndexes(collection_id);
@@ -222,6 +232,7 @@ export default class extends WorkerEntrypoint<Env> {
 
       // For each query embedding, search across all indexes in parallel
       const allSearchResults: Chunk[][] = [];
+      const failedIndexes: {indexName: string, error: string}[] = [];
 
       for (let i = 0; i < queryEmbeddings.data.length; i++) {
         const embedding = queryEmbeddings.data[i];
@@ -229,11 +240,13 @@ export default class extends WorkerEntrypoint<Env> {
 
         // Calculate how many results to fetch from each index
         // We need to ensure we get enough results even after filtering
-        const fetchCount = Math.min(Math.max(topK * 2, 10), 20);
-        console.log(`Fetching top ${fetchCount} results from each index`);
+        // Increase the fetch count to ensure we get enough chunks for deduplication
+        const fetchCount = Math.min(Math.max(topK * 2, 20), 10);
+        console.log(`Fetching top ${fetchCount} results from each index to ensure document diversity`);
 
         // Query each index in parallel and collect the results
-        const indexSearchPromises = collectionIndexes.indexes.map(async (indexName) => {
+        // Use Promise.allSettled instead of Promise.all to handle partial failures
+        const indexSearchPromises = collectionIndexes.indexes.map(async (indexName): Promise<IndexSearchResult> => {
           try {
             console.log(`Querying index: ${indexName}`);
 
@@ -279,14 +292,22 @@ export default class extends WorkerEntrypoint<Env> {
 
             if (!vectorMatches || !Array.isArray(vectorMatches.matches) || vectorMatches.matches.length === 0) {
               console.log(`No matches found in index ${indexName} for query "${queryArray[i]}"`);
-              return [] as Chunk[];
+              return { indexName, chunks: [] };
             }
 
             console.log(`Found ${vectorMatches.matches.length} matches in index ${indexName}`);
 
+            // Add default user_id to ALL matches that don't have one (only if needed)
+            for (const match of vectorMatches.matches) {
+              if (match.metadata && !match.metadata.user_id) {
+                console.log('Adding default user_id to match');
+                match.metadata.user_id = '0000000001';
+              }
+            }
+
             // Construct R2 keys for the matching vectors
             const r2KeysWithMetadata = vectorMatches.matches.map(match => {
-              if (!match.metadata || !match.metadata.user_id || !match.metadata.file_id || !match.id) {
+              if (!match.metadata || !match.metadata.user_id || !match.metadata.file_id || (!match.id && !match.metadata.batch_id)) {
                 console.error("Missing metadata fields in match:", match);
                 return null;
               }
@@ -297,7 +318,7 @@ export default class extends WorkerEntrypoint<Env> {
               // Get collection_id from metadata if using metadata field approach, or use the parameter if using namespace
               const collId = USE_NAMESPACE_FOR_COLLECTION ? collection_id : match.metadata.collection_id || collection_id;
               const fileId = match.metadata.file_id;
-              const batchId = match.id;
+              const batchId = match.id || match.metadata.batch_id;
               
               return {
                 key: `${userId}/${collId}/${fileId}/${batchId}.zip`,
@@ -309,7 +330,7 @@ export default class extends WorkerEntrypoint<Env> {
 
             if (r2KeysWithMetadata.length === 0) {
               console.error("No valid R2 keys could be constructed");
-              return [] as Chunk[];
+              return { indexName, chunks: [] };
             }
             
             const r2Keys = r2KeysWithMetadata.map(item => item.key);
@@ -320,7 +341,7 @@ export default class extends WorkerEntrypoint<Env> {
             
             if (!chunkResults || chunkResults.length === 0) {
               console.error(`No chunks returned from R2 for index ${indexName}`);
-              return [] as Chunk[];
+              return { indexName, chunks: [] };
             }
 
             // Process the chunks - extract them from the ZIP files and calculate similarity
@@ -426,28 +447,63 @@ export default class extends WorkerEntrypoint<Env> {
             
             // Sort chunks by similarity score and return
             processedChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
-            return processedChunks;
+            return { indexName, chunks: processedChunks };
             
           } catch (error) {
             console.error(`Error searching index ${indexName}:`, error);
-            // Re-throw the error to propagate it up
-            throw error;
+            
+            // Instead of re-throwing, return a result with an error field
+            return { 
+              indexName, 
+              chunks: [], 
+              error: error instanceof Error ? error.message : String(error)
+            };
           }
         });
 
-        // Wait for all index searches to complete
-        const indexResults = await Promise.all(indexSearchPromises);
+        // Wait for all index searches to complete, even ones that fail
+        const indexResults = await Promise.allSettled(indexSearchPromises);
         
-        // Combine results from all indexes
-        const combinedResults = indexResults.flat();
-        console.log(`Combined ${combinedResults.length} results from all indexes`);
+        // Combine all successful results and track failures
+        const successfulResults: Chunk[] = [];
+        const indexErrors: {indexName: string, error: string}[] = [];
+        
+        indexResults.forEach(result => {
+          if (result.status === 'fulfilled') {
+            // If this index search succeeded but had an error
+            if (result.value.error) {
+              indexErrors.push({
+                indexName: result.value.indexName,
+                error: result.value.error
+              });
+            }
+            // Add chunks from successful indexes
+            successfulResults.push(...result.value.chunks);
+          } else {
+            // Handle rejected promises - should be rare as we catch errors in the index search function
+            console.error(`Unexpected rejection for index search:`, result.reason);
+            indexErrors.push({
+              indexName: 'unknown',
+              error: result.reason instanceof Error ? result.reason.message : String(result.reason)
+            });
+          }
+        });
+        
+        // Track failed indexes for the final response
+        failedIndexes.push(...indexErrors);
+        
+        // Log summary of results
+        console.log(`Combined ${successfulResults.length} results from all indexes`);
+        if (indexErrors.length > 0) {
+          console.warn(`${indexErrors.length} indexes failed: ${indexErrors.map(e => e.indexName).join(', ')}`);
+        }
         
         // Sort by similarity score
-        combinedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+        successfulResults.sort((a, b) => (b.score || 0) - (a.score || 0));
         
-        // Take the top K
-        const topResults = combinedResults.slice(0, topK);
-        console.log(`Returning top ${topResults.length} results`);
+        // Take a larger number of top results to ensure we have enough after deduplication
+        const topResults = successfulResults.slice(0, fetchCount);
+        console.log(`Selected top ${topResults.length} chunks by score before document deduplication`);
         
         allSearchResults.push(topResults);
       }
@@ -455,27 +511,74 @@ export default class extends WorkerEntrypoint<Env> {
       // Combine results from all queries
       const allChunks = allSearchResults.flat();
       
-      // Take the top K unique results (by ID)
-      const seenIds = new Set<string>();
-      const uniqueChunks: Chunk[] = [];
+      // Group chunks by document (file ID)
+      const documentGroups = new Map<string, Chunk[]>();
       
       for (const chunk of allChunks) {
-        if (!seenIds.has(chunk.id) && uniqueChunks.length < topK) {
-          seenIds.add(chunk.id);
-          uniqueChunks.push(chunk);
+        if (chunk.metadata && chunk.metadata.file_id) {
+          const docKey = chunk.metadata.file_id;
+          if (!documentGroups.has(docKey)) {
+            documentGroups.set(docKey, []);
+          }
+          documentGroups.get(docKey)?.push(chunk);
         }
       }
       
-      console.log(`Returning ${uniqueChunks.length} unique chunks sorted by similarity score`);
+      console.log(`Grouped chunks into ${documentGroups.size} unique documents`);
+      
+      // Sort documents by their best chunk's score
+      const sortedDocuments = Array.from(documentGroups.entries()).map(([docId, chunks]) => {
+        // Sort chunks within each document by score
+        chunks.sort((a, b) => (b.score || 0) - (a.score || 0));
+        
+        return {
+          docId,
+          bestScore: chunks[0]?.score || 0,
+          chunks
+        };
+      });
+      
+      // Sort documents by their best score
+      sortedDocuments.sort((a, b) => b.bestScore - a.bestScore);
+      
+      // Take the top K unique documents
+      const topDocuments = sortedDocuments.slice(0, topK);
+      console.log(`Selected top ${topDocuments.length} unique documents`);
+      
+      // Collect all chunks from these top documents
+      const uniqueDocChunks: Chunk[] = [];
+      
+      for (const doc of topDocuments) {
+        uniqueDocChunks.push(...doc.chunks);
+      }
+      
+      console.log(`Returning ${uniqueDocChunks.length} chunks from ${topDocuments.length} unique documents`);
+      
+      // Determine if we should return partial success or full success
+      const hasFailedIndexes = failedIndexes.length > 0;
+      
+      // Prepare results grouped by document
+      const documentResults = topDocuments.map(doc => {
+        return {
+          document_id: doc.docId,
+          best_score: doc.bestScore,
+          chunks: doc.chunks.map(chunk => ({
+            id: chunk.id,
+            text: chunk.text,
+            score: chunk.score,
+            metadata: chunk.metadata
+          }))
+        };
+      });
+      
+      // Fetch additional metadata from KV for each document (not each chunk)
+      const enhancedDocuments = await this.enrichDocumentsWithFileMetadata(documentResults, collection_id);
       
       return {
-        status: 'success',
-        matches: uniqueChunks.map(chunk => ({
-          id: chunk.id,
-          text: chunk.text,
-          score: chunk.score,
-          metadata: chunk.metadata
-        }))
+        status: hasFailedIndexes ? 'partial_success' : 'success',
+        documents: enhancedDocuments,
+        total_chunks: uniqueDocChunks.length,
+        errors: hasFailedIndexes ? failedIndexes : undefined
       };
       
     } catch (error) {
@@ -846,5 +949,105 @@ export default class extends WorkerEntrypoint<Env> {
     
     console.log('Validated filters:', validatedFilters);
     return validatedFilters;
+  }
+
+  /**
+   * Enriches document results with additional file metadata from KV
+   * @param documents - Array of document results with their chunks to enrich
+   * @param collection_id - The collection ID to use in metadata keys
+   * @returns Enhanced array of document results with additional file metadata
+   */
+  async enrichDocumentsWithFileMetadata(documents: any[], collection_id: string): Promise<any[]> {
+    // Create a map to store unique file keys to avoid duplicate KV lookups
+    const fileMetadataKeys = new Map<string, any>();
+    
+    // Extract document metadata from the first chunk in each document
+    for (const doc of documents) {
+      if (doc.chunks && doc.chunks.length > 0) {
+        const firstChunk = doc.chunks[0];
+        if (firstChunk.metadata) {
+          const userId = firstChunk.metadata.user_id;
+          const collectionId = USE_NAMESPACE_FOR_COLLECTION 
+            ? collection_id 
+            : (firstChunk.metadata.collection_id || collection_id);
+          const fileId = firstChunk.metadata.file_id;
+          
+          if (userId && collectionId && fileId) {
+            // Format the key as "{userid}:{collectionid}:{fileid}"
+            const metadataKey = `${userId}:${collectionId}:${fileId}`;
+            
+            // Add to our map of keys to fetch
+            if (!fileMetadataKeys.has(metadataKey)) {
+              fileMetadataKeys.set(metadataKey, {
+                docIndex: documents.indexOf(doc),
+                docInfo: {
+                  userId,
+                  collectionId,
+                  fileId
+                }
+              });
+            }
+          }
+        }
+      }
+    }
+    
+    console.log(`Fetching additional file metadata for ${fileMetadataKeys.size} unique documents`);
+    
+    // If there are no keys to look up, return the original documents
+    if (fileMetadataKeys.size === 0) {
+      console.warn('No valid file metadata keys could be constructed');
+      return documents;
+    }
+    
+    try {
+      // Convert our keys to an array
+      const kvKeys = Array.from(fileMetadataKeys.keys());
+      
+      // Fetch all file metadata in batch to reduce API calls
+      // Handle each key individually to correctly type the response
+      const metadataPromises = kvKeys.map(async (key) => {
+        const result = await this.env.FILES_METADATA.getWithMetadata(key, 'json');
+        return { key, result };
+      });
+      
+      const results = await Promise.all(metadataPromises);
+      
+      // Process results and enhance documents
+      for (const { key, result } of results) {
+        if (result.value !== null) {
+          const docInfo = fileMetadataKeys.get(key);
+          if (docInfo) {
+            const docIndex = docInfo.docIndex;
+            const doc = documents[docIndex];
+            
+            // Add file info to the document
+            doc.file_info = result.value;
+            
+            // If there's KV metadata, add it under a separate key
+            if (result.metadata) {
+              doc.file_metadata = result.metadata;
+            }
+            
+            console.log(`Enhanced document ${doc.document_id} with file metadata`);
+            
+            // Also add to each chunk for backward compatibility
+            for (const chunk of doc.chunks) {
+              chunk.metadata.file_info = result.value;
+              if (result.metadata) {
+                chunk.metadata.file_kv_metadata = result.metadata;
+              }
+            }
+          }
+        }
+      }
+      
+      return documents;
+    } catch (error) {
+      console.error('Error fetching file metadata from KV:', error);
+      
+      // If there's an error, still return the original documents
+      return documents;
+    }
   }
 }

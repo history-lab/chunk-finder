@@ -1,5 +1,5 @@
 {
-  "name": "vector-search-worker-2",
+  "name": "vector-search-worker-3",
   "main": "src/index.ts",
   "compatibility_date": "2025-02-11",
   "compatibility_flags": ["nodejs_compat"],
@@ -18,6 +18,11 @@
       "binding": "COLLECTIONS_METADATA",
       "id": "301664cae3cf4c168644c16fbba05777",
       "preview_id": "301664cae3cf4c168644c16fbba05777"
+    },
+    {
+      "binding": "FILES_METADATA",
+      "id": "ad4060cc777e402aa19dc8b76a622aaa",
+      "preview_id": "ad4060cc777e402aa19dc8b76a622aaa"
     }
   ],
   "observability": {
