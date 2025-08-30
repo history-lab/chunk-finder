@@ -233,17 +233,18 @@ export default class extends WorkerEntrypoint<Env> {
       },
       important_notes: [
         'ALWAYS use collection_id: 80650a98-fe49-429a-afbd-9dde66e2d02b',
-        'Invalid collection_id returns empty results, not an error',
-        'Queries can be natural language questions or keywords',
+        'Invalid collection_id now returns an error (changed from previous behavior)',
+        'Use "filters" object for filtering instead of direct parameters',
+        'Results are grouped by document with chunks array per document',
+        'Date filtering uses YYYYMM format (authored_year_month)',
         'Scores above 0.7 indicate high relevance',
-        'Results include both individual chunk scores and cluster scores',
       ],
       collection: {
         required_id: '80650a98-fe49-429a-afbd-9dde66e2d02b',
         description:
-          'The ONLY valid collection ID. Using any other ID will return empty results.',
+          'The ONLY valid collection ID. Using any other ID will return a 404 error.',
         warning:
-          'Invalid collection IDs do not return errors - they return empty match arrays',
+          'Invalid collection IDs now return "Collection not found" errors',
       },
       endpoints: [
         {
@@ -271,7 +272,7 @@ export default class extends WorkerEntrypoint<Env> {
                 description:
                   'MUST be exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
                 value: '80650a98-fe49-429a-afbd-9dde66e2d02b',
-                warning: 'Any other value returns empty results without error',
+                warning: 'Any other value returns a 404 error',
               },
               topK: {
                 type: 'number',
@@ -281,81 +282,108 @@ export default class extends WorkerEntrypoint<Env> {
                   'Number of most similar results to return (1-100)',
                 examples: [5, 10, 20],
               },
-              corpus: {
-                type: 'string',
+              filters: {
+                type: 'object',
                 required: false,
-                description: 'Filter by document corpus/source',
-                valid_values: [
-                  'cfpf',
-                  'cia',
-                  'frus',
-                  'un',
-                  'worldbank',
-                  'clinton',
-                  'nato',
-                  'cabinet',
-                  'cpdoc',
-                  'kissinger',
-                  'briefing',
+                description: 'Advanced filtering options using query operators',
+                properties: {
+                  corpus: {
+                    type: 'string',
+                    description: 'Filter by document corpus/source',
+                    valid_values: [
+                      'cfpf',
+                      'cia',
+                      'frus',
+                      'un',
+                      'worldbank',
+                      'clinton',
+                      'nato',
+                      'cabinet',
+                      'cpdoc',
+                      'kissinger',
+                      'briefing',
+                    ],
+                    example: 'cia',
+                  },
+                  doc_id: {
+                    type: 'string',
+                    description: 'Filter by specific document ID',
+                    example: 'CIA-RDP80B01676R002800240004-4',
+                  },
+                  authored_year_month: {
+                    type: 'number | object',
+                    description: 'Filter by authored date in YYYYMM format',
+                    examples: [
+                      '197310 (October 1973)',
+                      '{"{"$gte": 196501, "$lte": 197512} (1965-1975)',
+                    ],
+                    operators: ['$eq', '$ne', '$gte', '$lte', '$in', '$nin'],
+                  },
+                  authored_year_month_day: {
+                    type: 'number | object',
+                    description: 'Filter by authored date in YYYYMMDD format',
+                    examples: [
+                      '19731015 (October 15, 1973)',
+                      '{"{"$gte": 19650101, "$lte": 19751231}',
+                    ],
+                    operators: ['$eq', '$ne', '$gte', '$lte', '$in', '$nin'],
+                  },
+                },
+                supported_operators: [
+                  '$eq - equals',
+                  '$ne - not equals',
+                  '$gte - greater than or equal',
+                  '$lte - less than or equal',
+                  '$in - in array',
+                  '$nin - not in array',
                 ],
-                examples: ['cia', 'frus', 'clinton'],
-                note: 'Invalid corpus values return an error',
-              },
-              doc_id: {
-                type: 'string',
-                required: false,
-                description: 'Filter by specific document ID',
-                examples: ['CIA-RDP80B01676R002800240004-4', 'P790016-1808'],
-              },
-              authored_start: {
-                type: 'string',
-                required: false,
-                description:
-                  'Filter documents authored on or after this date (YYYY-MM-DD format)',
-                example: '1960-01-01',
-                note: 'Converted to Unix timestamp internally',
-              },
-              authored_end: {
-                type: 'string',
-                required: false,
-                description:
-                  'Filter documents authored on or before this date (YYYY-MM-DD format)',
-                example: '1989-12-31',
-                note: 'Converted to Unix timestamp internally',
               },
             },
           },
           response: {
             success: {
               status: 'success',
-              matches: [
+              documents: [
                 {
-                  id: 'string - Unique chunk identifier (e.g., "651296f4-14f0-44b7-a773-74a08f58b1dc_0")',
-                  text: 'string - The actual text content of the chunk',
-                  score:
-                    'number - Similarity score (0-1, higher is more similar. 0.7+ is highly relevant)',
-                  metadata: {
-                    corpus: 'string - Source corpus (e.g., "cia", "cfpf")',
-                    doc_id: 'string - Document identifier',
-                    authored: 'number - Unix timestamp in milliseconds',
-                    date: 'string - ISO date string (may be null)',
-                    classification:
-                      'string - Security classification (e.g., "unclassified")',
-                    title: 'string - Document title',
-                    source: 'string - Source URL (may be null)',
-                    file_id: 'string - Source file identifier',
-                    file_name: 'string - Original file name',
-                    file_key: 'string - R2 storage key',
-                    batch_size: 'number - Number of chunks in batch',
-                    total_chunks: 'number - Total chunks in document',
-                    is_anchor: 'boolean - Whether this is an anchor chunk',
-                    user_id: 'string - User who created the embedding',
-                    collection_id: 'string - Collection identifier',
-                    cluster_id: 'string - Cluster identifier for grouped chunks',
-                    cluster_score: 'number - Cluster-level similarity score',
-                  },
-                },
+                  document_id: 'string - Unique document identifier (file_id)',
+                  best_score: 'number - Highest chunk score in this document',
+                  chunks: [
+                    {
+                      id: 'string - Unique chunk identifier (e.g., "bd8b3dd6-f442-4d36-9750-c1b4ae63b6d4_0")',
+                      text: 'string - The actual text content of the chunk',
+                      score: 'number - Similarity score (0-1, higher is more similar. 0.7+ is highly relevant)',
+                      metadata: {
+                        authored_year_month: 'number - Date in YYYYMM format (e.g., 198209)',
+                        authored_year_month_day: 'number - Date in YYYYMMDD format (e.g., 19820926)',
+                        batch_id: 'string - Batch identifier for grouping',
+                        doc_id: 'string - Document identifier',
+                        file_id: 'string - Source file identifier',
+                        user_id: 'string - User who created the embedding',
+                        cluster_id: 'string - Cluster identifier',
+                        cluster_score: 'number - Cluster-level similarity score',
+                        index_name: 'string - Vector index used (e.g., "history-lab-5")',
+                        file_info: {
+                          id: 'string - File ID',
+                          name: 'string - Original file name',
+                          size: 'number - File size in bytes',
+                          type: 'string - MIME type',
+                          metadata: {
+                            doc_id: 'string - Document identifier',
+                            corpus: 'string - Source corpus',
+                            classification: 'string - Security classification',
+                            date: 'string - ISO date string',
+                            authored: 'number - Unix timestamp',
+                            title: 'string - Document title',
+                            source: 'string | null - Source URL'
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  file_info: 'object - Same file_info object as in chunks for convenience'
+                }
               ],
+              total_chunks: 'number - Total number of chunks across all documents'
             },
             error: {
               status: 'error',
@@ -372,22 +400,21 @@ export default class extends WorkerEntrypoint<Env> {
   }'`,
             },
             {
-              description: 'Search with filters',
+              description: 'Search with corpus filter',
               curl: `curl -X POST https://vector-search-worker.nchimicles.workers.dev/api/search \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -d '{\
-    "queries": "Cuban Missile Crisis",\
+    "queries": "nuclear weapons",\
     "collection_id": "80650a98-fe49-429a-afbd-9dde66e2d02b",\
-    "topK": 10,\
-    "corpus": "cia",\
-    "authored_start": "1962-01-01",\
-    "authored_end": "1963-12-31"\
+    "topK": 5,\
+    "filters": {"corpus": "cia"}\
   }'`,
             },
             {
-              description: 'Multiple queries',
+              description: 'Search with date range filter',
               curl: `curl -X POST https://vector-search-worker.nchimicles.workers.dev/api/search \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -d '{\
-    "queries": ["Cuban Missile Crisis", "Berlin Wall", "Vietnam War"],\
+    "queries": "Vietnam War",\
     "collection_id": "80650a98-fe49-429a-afbd-9dde66e2d02b",\
-    "topK": 3\
+    "topK": 3,\
+    "filters": {"authored_year_month": {"$gte": 196501, "$lte": 197512}}\
   }'`,
             },
           ],
@@ -433,14 +460,15 @@ export default class extends WorkerEntrypoint<Env> {
           kissinger: 'Henry Kissinger papers - 1970s diplomatic correspondence',
           briefing: 'Presidential daily briefings - Intelligence summaries',
         },
-        date_range: {
-          format: 'YYYY-MM-DD',
+        date_filtering: {
+          format: 'YYYYMM or YYYYMMDD',
           description:
-            'Filter by document authored date. Dates are converted to Unix timestamps.',
+            'Use authored_year_month or authored_year_month_day with operators for date filtering.',
           examples: [
-            'Cold War era: authored_start="1947-01-01", authored_end="1991-12-31"',
-            'Vietnam War period: authored_start="1965-01-01", authored_end="1975-12-31"',
-            '1960s: authored_start="1960-01-01", authored_end="1969-12-31"',
+            'Cold War era: {"authored_year_month": {"$gte": 194701, "$lte": 199112}}',
+            'Vietnam War period: {"authored_year_month": {"$gte": 196501, "$lte": 197512}}',
+            'Specific year: {"authored_year_month": {"$gte": 196001, "$lte": 196912}}',
+            'Exact date: {"authored_year_month_day": 19621015}',
           ],
         },
       },
@@ -448,8 +476,9 @@ export default class extends WorkerEntrypoint<Env> {
         best_practices: [
           'Use natural language queries for best results (e.g., "Cuban Missile Crisis negotiations")',
           'Be specific but not too narrow (e.g., "Cold War tensions" vs "Cold War")',
-          'Combine filters for precise results (corpus + date range)',
-          'Higher topK values (10-20) provide more context',
+          'Use the "filters" object to combine multiple criteria',
+          'Higher topK values (10-20) provide more context across documents',
+          'Results are grouped by document - each document may contain multiple relevant chunks',
           'Scores above 0.7 indicate strong relevance, above 0.8 is very strong',
         ],
         example_queries: {
@@ -474,16 +503,28 @@ export default class extends WorkerEntrypoint<Env> {
         },
       },
       troubleshooting: {
+        collection_not_found_error: [
+          'Ensure collection_id is exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
+          'Check for typos in the collection ID',
+          'Verify the collection exists and is accessible',
+        ],
         empty_results: [
-          'Check collection_id is exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
-          'Verify your API key is correct',
           'Try broader search terms',
-          'Remove filters to test if they are too restrictive',
+          'Remove or adjust filters if they are too restrictive',
+          'Check if your query terms exist in the historical period you are filtering by',
+          'Verify filter syntax (use operators like $gte, $lte for date ranges)',
         ],
         low_scores: [
-          'Rephrase query using different terms',
+          'Rephrase query using different terms or synonyms',
           'Try more specific or contextual queries',
+          'Use natural language instead of just keywords',
           'Check if the topic exists in the time period searched',
+        ],
+        filter_errors: [
+          'Use the "filters" object instead of direct parameters',
+          'Check date format: use authored_year_month (YYYYMM) or authored_year_month_day (YYYYMMDD)',
+          'Use proper operators: $eq, $ne, $gte, $lte, $in, $nin',
+          'Ensure corpus values are valid: cia, cfpf, frus, etc.',
         ],
       },
       rate_limits: {
@@ -493,10 +534,14 @@ export default class extends WorkerEntrypoint<Env> {
       },
       notes: [
         'Collection ID must be exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
-        'Invalid collection IDs return empty results, not errors',
+        'Invalid collection IDs now return 404 errors (changed from previous behavior)',
+        'Results are grouped by document with chunks array per document',
+        'Use "filters" object with operators instead of direct filter parameters',
+        'Date filtering uses YYYYMM format (authored_year_month) or YYYYMMDD (authored_year_month_day)',
         'The API uses semantic search - natural language queries work best',
-        'Results include both chunk-level and cluster-level similarity scores',
-        'Metadata includes rich context: dates, sources, classifications, document titles',
+        'Documents are ranked by their highest-scoring chunk (best_score)',
+        'Rich file_info metadata includes document titles, sources, classifications',
+        'Multiple vector indexes are searched and results are combined',
         'Filters are applied at the vector database level for efficiency',
       ],
     };
