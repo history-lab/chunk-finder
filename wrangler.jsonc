@@ -6,12 +6,6 @@
   "ai": {
     "binding": "AI"
   },
-  "vectorize": [
-    {
-      "binding": "VECTORIZE",
-      "index_name": "history-lab-1"
-    }
-  ],
   "r2_buckets": [
     {
       "binding": "RAMUS_EMBEDDINGS",
@@ -19,12 +13,18 @@
       "preview_bucket_name": "ramus-embeddings-preview"
     }
   ],
-  // Secret for API authentication
-  // Set this using: wrangler secret put API_SECRET_KEY
-  // For local development, create a .dev.vars file with API_SECRET_KEY=your-secret
-  "vars": {
-    // This can be overridden in production with secrets
-  },
+  "kv_namespaces": [
+    {
+      "binding": "COLLECTIONS_METADATA",
+      "id": "301664cae3cf4c168644c16fbba05777",
+      "preview_id": "301664cae3cf4c168644c16fbba05777"
+    },
+    {
+      "binding": "FILES_METADATA",
+      "id": "ad4060cc777e402aa19dc8b76a622aaa",
+      "preview_id": "ad4060cc777e402aa19dc8b76a622aaa"
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
