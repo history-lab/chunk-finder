@@ -19,6 +19,12 @@
       "preview_bucket_name": "ramus-embeddings-preview"
     }
   ],
+  // Secret for API authentication
+  // Set this using: wrangler secret put API_SECRET_KEY
+  // For local development, create a .dev.vars file with API_SECRET_KEY=your-secret
+  "vars": {
+    // This can be overridden in production with secrets
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
