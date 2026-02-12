@@ -11,6 +11,11 @@
       "binding": "RAMUS_EMBEDDINGS",
       "bucket_name": "ramus-embeddings",
       "preview_bucket_name": "ramus-embeddings-preview"
+    },
+    {
+      "binding": "RAMUS_FILES",
+      "bucket_name": "ramus-files",
+      "preview_bucket_name": "ramus-files-preview"
     }
   ],
   "kv_namespaces": [

@@ -1,10 +1,15 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import JSZip from "jszip";
 
+// Default collection ID for HistoryLab
+const DEFAULT_COLLECTION_ID = '80650a98-fe49-429a-afbd-9dde66e2d02b';
+
 interface Env {
   AI: any;
   RAMUS_EMBEDDINGS: R2Bucket;
+  RAMUS_FILES: R2Bucket;
   API_SECRET_KEY?: string;
+  API_SECRET_KEY_2?: string;
   VECTORIZE_API_TOKEN: string;
   ACCOUNT_ID: string;
   COLLECTIONS_METADATA: KVNamespace;
@@ -116,6 +121,7 @@ export default class extends WorkerEntrypoint<Env> {
 
   /**
    * Middleware to check API authentication
+   * Supports multiple API keys to avoid breaking existing integrations
    */
   private async authenticateApiRequest(request: Request): Promise<boolean> {
     const authHeader = request.headers.get('Authorization');
@@ -125,26 +131,31 @@ export default class extends WorkerEntrypoint<Env> {
     }
 
     const providedKey = authHeader.substring(7); // Remove 'Bearer ' prefix
-    const expectedKey = this.env.API_SECRET_KEY;
 
-    if (!expectedKey) {
-      console.error('API_SECRET_KEY not configured');
+    // Collect all valid API keys
+    const validKeys: string[] = [];
+    if (this.env.API_SECRET_KEY) validKeys.push(this.env.API_SECRET_KEY);
+    if (this.env.API_SECRET_KEY_2) validKeys.push(this.env.API_SECRET_KEY_2);
+
+    if (validKeys.length === 0) {
+      console.error('No API keys configured');
       return false;
     }
 
-    // Constant-time comparison to prevent timing attacks
-    if (providedKey.length !== expectedKey.length) {
-      return false;
-    }
-
-    let equal = true;
-    for (let i = 0; i < providedKey.length; i++) {
-      if (providedKey[i] !== expectedKey[i]) {
-        equal = false;
+    // Check against all valid keys (constant-time comparison for each)
+    for (const expectedKey of validKeys) {
+      if (providedKey.length === expectedKey.length) {
+        let equal = true;
+        for (let i = 0; i < providedKey.length; i++) {
+          if (providedKey[i] !== expectedKey[i]) {
+            equal = false;
+          }
+        }
+        if (equal) return true;
       }
     }
 
-    return equal;
+    return false;
   }
 
   /**
@@ -202,6 +213,11 @@ export default class extends WorkerEntrypoint<Env> {
       return this.getAboutResponse();
     }
 
+    // Handle document fetch endpoint
+    if (url.pathname.startsWith('/api/document/') && request.method === 'GET') {
+      return this.handleDocumentRequest(request);
+    }
+
     // Return 404 for unknown API endpoints
     return new Response(
       JSON.stringify({
@@ -213,6 +229,91 @@ export default class extends WorkerEntrypoint<Env> {
         headers: { 'Content-Type': 'application/json' },
       },
     );
+  }
+
+  /**
+   * Handle document fetch requests
+   * Returns full document text and metadata from R2 storage
+   */
+  private async handleDocumentRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    // Extract and decode the r2Key from the path
+    const r2Key = decodeURIComponent(url.pathname.replace('/api/document/', ''));
+
+    if (!r2Key) {
+      return new Response(
+        JSON.stringify({ status: 'error', message: 'Missing document path' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log(`Fetching document with r2Key: ${r2Key}`);
+
+    try {
+      // Fetch document from R2
+      const object = await this.env.RAMUS_FILES.get(r2Key);
+
+      if (!object) {
+        console.log(`Document not found: ${r2Key}`);
+        return new Response(
+          JSON.stringify({ status: 'error', message: 'Document not found' }),
+          { status: 404, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Get text content
+      const text = await object.text();
+      console.log(`Retrieved document with ${text.length} characters`);
+
+      // Extract metadata key from r2Key path: userId/collectionId/fileId/filename
+      const pathParts = r2Key.split('/');
+      let metadata = null;
+
+      if (pathParts.length >= 3) {
+        const userId = pathParts[0];
+        const collectionId = pathParts[1];
+        const fileId = pathParts[2];
+        const metadataKey = `${userId}:${collectionId}:${fileId}`;
+
+        try {
+          const metadataJson = await this.env.FILES_METADATA.get(metadataKey);
+          if (metadataJson) {
+            metadata = JSON.parse(metadataJson);
+            console.log(`Retrieved metadata for document`);
+          }
+        } catch (e) {
+          console.error('Error fetching metadata:', e);
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: 'success',
+          document: {
+            r2Key,
+            text,
+            metadata: metadata?.metadata || null,
+            file_info: metadata ? {
+              id: metadata.id,
+              name: metadata.name,
+              size: metadata.size,
+              type: metadata.type
+            } : null
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    } catch (error) {
+      console.error('Error fetching document:', error);
+      return new Response(
+        JSON.stringify({
+          status: 'error',
+          message: 'Error fetching document',
+          error: error instanceof Error ? error.message : String(error)
+        }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
   }
 
   /**
@@ -240,11 +341,10 @@ export default class extends WorkerEntrypoint<Env> {
         'Scores above 0.7 indicate high relevance',
       ],
       collection: {
-        required_id: '80650a98-fe49-429a-afbd-9dde66e2d02b',
+        default_id: '80650a98-fe49-429a-afbd-9dde66e2d02b',
         description:
-          'The ONLY valid collection ID. Using any other ID will return a 404 error.',
-        warning:
-          'Invalid collection IDs now return "Collection not found" errors',
+          'The collection_id parameter is optional. If omitted, searches default to the HistoryLab collection.',
+        note: 'You can simply omit collection_id from your requests.',
       },
       endpoints: [
         {
@@ -268,11 +368,11 @@ export default class extends WorkerEntrypoint<Env> {
               },
               collection_id: {
                 type: 'string',
-                required: true,
+                required: false,
+                default: '80650a98-fe49-429a-afbd-9dde66e2d02b',
                 description:
-                  'MUST be exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
-                value: '80650a98-fe49-429a-afbd-9dde66e2d02b',
-                warning: 'Any other value returns a 404 error',
+                  'Collection to search. Defaults to HistoryLab collection if omitted.',
+                note: 'You can omit this parameter - it defaults to the HistoryLab collection.',
               },
               topK: {
                 type: 'number',
@@ -392,10 +492,9 @@ export default class extends WorkerEntrypoint<Env> {
           },
           example_requests: [
             {
-              description: 'Simple search',
+              description: 'Simple search (collection_id optional)',
               curl: `curl -X POST https://vector-search-worker.nchimicles.workers.dev/api/search \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -d '{\
     "queries": "Cold War",\
-    "collection_id": "80650a98-fe49-429a-afbd-9dde66e2d02b",\
     "topK": 5\
   }'`,
             },
@@ -442,6 +541,56 @@ export default class extends WorkerEntrypoint<Env> {
           method: 'GET',
           description: 'Learn about the search technology and architecture',
           authentication: 'Required',
+        },
+        {
+          path: '/api/document/:r2Key',
+          method: 'GET',
+          description: 'Fetch full document text and metadata by R2 key path',
+          authentication: 'Required',
+          request: {
+            path_parameters: {
+              r2Key: {
+                type: 'string',
+                required: true,
+                description: 'The R2 key path from search results (found in file_info or construct from userId/collectionId/fileId/filename). URL-encode if it contains special characters.',
+                example: '0000000001/80650a98-fe49-429a-afbd-9dde66e2d02b/abc123-def456/document.txt'
+              }
+            }
+          },
+          response: {
+            success: {
+              status: 'success',
+              document: {
+                r2Key: 'string - The R2 key path used to fetch the document',
+                text: 'string - Full document text content',
+                metadata: {
+                  doc_id: 'string - Document identifier (e.g., CIA-RDP80B01676R002800240004-4)',
+                  corpus: 'string - Source corpus (cia, cfpf, frus, etc.)',
+                  classification: 'string - Security classification',
+                  title: 'string - Document title',
+                  date: 'string - Document date (ISO format)',
+                  source: 'string | null - Source URL if available'
+                },
+                file_info: {
+                  id: 'string - File UUID',
+                  name: 'string - Original filename',
+                  size: 'number - File size in bytes',
+                  type: 'string - MIME type (e.g., text/plain)'
+                }
+              }
+            },
+            error: {
+              status: 'error',
+              message: 'string - Error description'
+            }
+          },
+          example_curl: `curl -X GET "https://vector-search-worker.nchimicles.workers.dev/api/document/0000000001/80650a98-fe49-429a-afbd-9dde66e2d02b/abc123/doc.txt" \\\n  -H "Authorization: Bearer YOUR_API_KEY"`,
+          notes: [
+            'The r2Key can be constructed from search results: {userId}/{collectionId}/{fileId}/{filename}',
+            'For the HistoryLab collection, userId is typically 0000000001',
+            'URL-encode the path if the filename contains special characters',
+            'Returns the full document text along with metadata from the FILES_METADATA KV store'
+          ]
         },
       ],
       filters: {
@@ -526,11 +675,17 @@ export default class extends WorkerEntrypoint<Env> {
           'Use proper operators: $eq, $ne, $gte, $lte, $in, $nin',
           'Ensure corpus values are valid: cia, cfpf, frus, etc.',
         ],
+        topK_errors: [
+          'Ensure topK is a number between 1 and 100',
+          'Invalid values: 0, negative numbers, strings, or values > 100',
+          'If not specified, defaults to 5',
+        ],
       },
       rate_limits: {
         requests_per_minute: 60,
         max_queries_per_request: 10,
         max_topK: 100,
+        max_fetch_count_per_index: 50,
       },
       notes: [
         'Collection ID must be exactly: 80650a98-fe49-429a-afbd-9dde66e2d02b',
@@ -543,6 +698,7 @@ export default class extends WorkerEntrypoint<Env> {
         'Rich file_info metadata includes document titles, sources, classifications',
         'Multiple vector indexes are searched and results are combined',
         'Filters are applied at the vector database level for efficiency',
+        'fetchCount per index is capped at 50 for Vectorize API compatibility',
       ],
     };
 
@@ -573,18 +729,30 @@ export default class extends WorkerEntrypoint<Env> {
           vector_database: {
             name: 'Cloudflare Vectorize',
             description:
-              'Stores and indexes document embeddings for fast similarity search',
+              'Multiple vector indexes storing document embeddings for fast similarity search',
             features: [
-              'Cosine similarity search',
-              'Metadata filtering',
-              'Scalable to millions of vectors',
+              'Multiple indexes per collection for scalability',
+              'Cosine similarity search with filtering',
+              'Namespace-based collection isolation',
+              'Advanced metadata filtering with operators',
+              'Scalable to millions of vectors across indexes',
             ],
           },
           storage: {
             name: 'Cloudflare R2',
             description:
               'Object storage for document chunks and their embeddings',
-            structure: 'Organized in compressed batches for efficient retrieval',
+            structure: 'Organized in compressed ZIP batches by user/collection/file/batch',
+          },
+          metadata_storage: {
+            name: 'Cloudflare KV',
+            description:
+              'Key-value storage for collection and file metadata',
+            stores: [
+              'Collection indexes and metadata configurations',
+              'File metadata with document information',
+              'Search filtering configurations',
+            ],
           },
         },
       },
@@ -592,33 +760,51 @@ export default class extends WorkerEntrypoint<Env> {
         steps: [
           {
             step: 1,
+            name: 'Collection Validation',
+            description:
+              'The collection_id is validated and collection metadata is retrieved from KV storage to determine which vector indexes to query.',
+          },
+          {
+            step: 2,
             name: 'Query Embedding',
             description:
               'Your search query is converted into a 768-dimensional vector using the BGE model. This vector represents the semantic meaning of your query.',
           },
           {
-            step: 2,
-            name: 'Vector Similarity Search',
-            description:
-              'The query vector is compared against millions of document vectors using cosine similarity. This finds documents with similar semantic meaning, even if they use different words.',
-          },
-          {
             step: 3,
-            name: 'Metadata Filtering',
+            name: 'Multi-Index Vector Search',
             description:
-              'Results are filtered based on your criteria (corpus, date range, document ID) at the database level for efficiency.',
+              'The query vector is searched across all vector indexes in the collection in parallel. Each index may contain different subsets of documents for optimal performance.',
           },
           {
             step: 4,
-            name: 'Chunk Retrieval',
+            name: 'Advanced Filtering',
             description:
-              'The most similar document chunks are retrieved from R2 storage. Documents are split into chunks for granular matching.',
+              'Results are filtered using advanced operators ($gte, $lte, $eq, etc.) on metadata fields like authored_year_month, corpus, and doc_id at the database level.',
           },
           {
             step: 5,
-            name: 'Ranking and Response',
+            name: 'Chunk Retrieval and Processing',
             description:
-              'Results are ranked by similarity score and returned with their metadata and relevance scores.',
+              'The most similar document chunks are retrieved from R2 storage and processed. Documents are split into meaningful chunks for granular matching.',
+          },
+          {
+            step: 6,
+            name: 'Document Grouping and Deduplication',
+            description:
+              'Chunks are grouped by document (file_id) and deduplicated. Each document gets a best_score from its highest-scoring chunk.',
+          },
+          {
+            step: 7,
+            name: 'Metadata Enrichment',
+            description:
+              'Documents are enriched with additional file metadata from KV storage, including titles, sources, classifications, and creation dates.',
+          },
+          {
+            step: 8,
+            name: 'Document-Level Ranking',
+            description:
+              'Documents are ranked by their best chunk score and returned with all relevant chunks grouped together.',
           },
         ],
       },
@@ -647,36 +833,53 @@ export default class extends WorkerEntrypoint<Env> {
           'In practice, results with scores above 0.7 are typically what users want',
       },
       data_format: {
+        response_structure: 'Results grouped by document with chunks array per document',
         chunk_size:
           'Documents are split into meaningful chunks (typically 1-3 paragraphs)',
         embedding_storage:
-          'Float32Array binary format for efficient storage and computation',
+          'Float32Array binary format stored in ZIP files for efficient storage and computation',
         compression: 'ZIP compression reduces storage size by ~60%',
-        metadata:
-          'Each chunk includes source, date, and document identification',
+        date_formats: {
+          authored_year_month: 'YYYYMM format (e.g., 198209 for September 1982)',
+          authored_year_month_day: 'YYYYMMDD format (e.g., 19820926 for September 26, 1982)',
+        },
+        metadata_structure: {
+          chunk_metadata: 'Includes dates, IDs, scores, and index information',
+          file_info: 'Rich document information including title, source, classification',
+          collection_info: 'Collection and user identification data',
+        },
       },
       performance: {
-        query_latency: 'Typically 200-500ms for vector search',
+        query_latency: 'Typically 300-800ms for multi-index search with document grouping',
         concurrent_requests: 6,
-        index_size: 'Scales to millions of document embeddings',
+        multi_index_strategy: 'Parallel querying across multiple vector indexes for scalability',
+        deduplication: 'Document-level deduplication ensures unique results per file',
+        metadata_enrichment: 'KV lookups add ~50-100ms for rich document information',
+        index_size: 'Each index scales to millions of vectors, multiple indexes per collection',
         accuracy: 'BGE model provides state-of-the-art semantic understanding',
       },
       use_cases: [
-        'Historical research: Find all documents about specific events (e.g., Cuban Missile Crisis)',
-        'Cross-archive search: Search across CIA, State Department, UN documents simultaneously',
-        'Timeline analysis: Filter by date ranges to understand event progression',
-        'Entity research: Find all mentions of specific people, places, or organizations',
-        'Thematic research: Discover documents about concepts like "nuclear deterrence" or "Cold War tensions"',
-        'Comparative analysis: Find similar events or patterns across different time periods',
-        'Primary source discovery: Locate original documents and intelligence reports',
+        'Historical research: Find all documents about specific events grouped by source document',
+        'Cross-archive search: Use filters like {"corpus": "cia"} to search specific archives',
+        'Timeline analysis: Use date filters like {"authored_year_month": {"$gte": 196201, "$lte": 196212}} for Cuban Missile Crisis period',
+        'Entity research: Find mentions of people/places with document-level context',
+        'Thematic research: Discover documents about concepts with full document context per result',
+        'Comparative analysis: Compare events across time periods using precise date filtering',
+        'Primary source discovery: Get rich document metadata including titles, sources, and classifications',
+        'Document browsing: Each result shows the complete document with all relevant chunks',
       ],
       advantages: {
         semantic_understanding:
           "Finds relevant content even when exact keywords don't match",
+        document_grouping: 'Results grouped by document provide better context and readability',
+        advanced_filtering: 'Sophisticated date and metadata filtering with mathematical operators',
+        multi_index_scalability: 'Parallel search across multiple indexes for better performance',
+        rich_metadata: 'Comprehensive document information including titles, sources, and classifications',
         multilingual: 'Can find related content across language barriers',
         contextual: 'Understands the context and meaning of queries',
         efficient:
-          'Vector search is much faster than traditional full-text search for semantic queries',
+          'Vector search with document deduplication is faster than traditional approaches',
+        comprehensive: 'Each result provides full document context with all relevant chunks',
       },
     };
 
@@ -718,7 +921,7 @@ export default class extends WorkerEntrypoint<Env> {
     try {
       const body = (await request.json()) as {
         queries: string | string[];
-        collection_id: string;
+        collection_id?: string;
         topK?: number;
         corpus?: string;
         doc_id?: string;
@@ -745,7 +948,7 @@ export default class extends WorkerEntrypoint<Env> {
    */
   private async processSearchRequest(body: {
     queries: string | string[];
-    collection_id: string;
+    collection_id?: string;
     topK?: number;
     corpus?: string;
     doc_id?: string;
@@ -755,7 +958,7 @@ export default class extends WorkerEntrypoint<Env> {
   }): Promise<Response> {
     console.log('Received search request:', JSON.stringify(body, null, 2));
 
-    const { queries, collection_id, topK = 5, filters } = body;
+    const { queries, collection_id = DEFAULT_COLLECTION_ID, topK = 5, filters } = body;
 
     if (!queries) {
       console.error('Missing required parameter: queries');
@@ -764,7 +967,19 @@ export default class extends WorkerEntrypoint<Env> {
           status: 'error',
           message: 'Missing required parameter: queries',
         }),
-        { status: 400 },
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+
+    // Validate topK range
+    if (topK !== undefined && (typeof topK !== 'number' || topK < 1 || topK > 100)) {
+      console.error(`Invalid topK value: ${topK}. Must be a number between 1 and 100`);
+      return new Response(
+        JSON.stringify({
+          status: 'error',
+          message: 'topK must be a number between 1 and 100',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
       );
     }
 
@@ -910,9 +1125,17 @@ export default class extends WorkerEntrypoint<Env> {
         console.log(`Processing query: "${queryArray[i]}" (truncated)`);
 
         // Calculate how many results to fetch from each index
-        const fetchCount = Math.min(Math.max(topK * 2, 20), 10);
+        // For multiple queries, we need more results to account for deduplication
+        const queryMultiplier = queryArray.length > 1 ? queryArray.length : 1;
+        const baseFetchCount = Math.max(topK * 2 * queryMultiplier, 20);
+        const fetchCount = Math.min(baseFetchCount, 50); // Cap at 50 to prevent Vectorize API errors
+        
+        if (baseFetchCount > 50) {
+          console.warn(`fetchCount capped at 50 (was ${baseFetchCount}) for Vectorize API compatibility. topK=${topK}, queries=${queryArray.length}`);
+        }
+        
         console.log(
-          `Fetching top ${fetchCount} results from each index to ensure document diversity`,
+          `Fetching top ${fetchCount} results from each index (${queryArray.length} queries, topK=${topK}) to ensure document diversity`,
         );
 
         // Query each index in parallel and collect the results
@@ -1237,6 +1460,7 @@ export default class extends WorkerEntrypoint<Env> {
 
       // Combine results from all queries
       const allChunks = allSearchResults.flat();
+      console.log(`Combined ${allChunks.length} total chunks from ${queryArray.length} queries`);
 
       // Group chunks by document (file ID)
       const documentGroups = new Map<string, Chunk[]>();
@@ -1251,7 +1475,7 @@ export default class extends WorkerEntrypoint<Env> {
         }
       }
 
-      console.log(`Grouped chunks into ${documentGroups.size} unique documents`);
+      console.log(`Grouped ${allChunks.length} chunks into ${documentGroups.size} unique documents`);
 
       // Sort documents by their best chunk's score
       const sortedDocuments = Array.from(documentGroups.entries()).map(
@@ -1270,9 +1494,10 @@ export default class extends WorkerEntrypoint<Env> {
       // Sort documents by their best score
       sortedDocuments.sort((a, b) => b.bestScore - a.bestScore);
 
-      // Take the top K unique documents
-      const topDocuments = sortedDocuments.slice(0, topK);
-      console.log(`Selected top ${topDocuments.length} unique documents`);
+      // For multiple queries, scale up the document limit to ensure fair representation
+      const documentLimit = queryArray.length > 1 ? Math.max(topK, Math.min(topK * queryArray.length, 20)) : topK;
+      const topDocuments = sortedDocuments.slice(0, documentLimit);
+      console.log(`Selected top ${topDocuments.length} unique documents (${queryArray.length} queries, limit=${documentLimit})`);
 
       // Collect all chunks from these top documents
       const uniqueDocChunks: Chunk[] = [];

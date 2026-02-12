@@ -1,197 +1,89 @@
-# Cloudflare Vector Search Worker
+# HistoryLab Vector Search API
 
-This Cloudflare Worker provides functionality for searching through vector embeddings using Cloudflare Vectorize and Workers AI.
+A Cloudflare Worker providing semantic search across ~5 million declassified historical documents.
 
-## Features
+## Quick Start
 
-- Search for similar embeddings across multiple query terms
-- Return results sorted by similarity score
-- Support for parallel processing of multiple queries
-- Deduplication of results
+**Base URL:** `https://vector-search-worker.nchimicles.workers.dev`
 
-## API Usage
+### Search for Documents
 
-### Search for Similar Embeddings
-
-```http
-POST /
-Content-Type: application/json
-
-{
-  "queries": ["Your search query", "Another search query"],
-  "collection_id": "your-collection-id",
-  "topK": 5
-}
+```bash
+curl -X POST "https://vector-search-worker.nchimicles.workers.dev/api/search" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queries": "Cuban Missile Crisis",
+    "topK": 5
+  }'
 ```
 
-### Parameters
+### Fetch Full Document
 
-- `queries`: A string or array of strings to search for
-- `collection_id`: The ID of the Vectorize collection to search in
-- `topK` (optional): Number of results to return (default: 5)
-
-### Response Format
-
-```json
-{
-  "status": "success",
-  "matches": [
-    {
-      "id": "chunk-123",
-      "score": 0.95,
-      "metadata": {
-        "text": "The matching text content",
-        "additional_field": "Any additional metadata"
-      }
-    },
-    {
-      "id": "chunk-456",
-      "score": 0.92,
-      "metadata": {
-        "text": "Another relevant text match",
-        "additional_field": "Any additional metadata"
-      }
-    }
-  ]
-}
+```bash
+curl -X GET "https://vector-search-worker.nchimicles.workers.dev/api/document/{r2Key}" \
+  -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-## Configuration
+## Documentation
 
-Make sure to bind the following:
+See **[API_DOCUMENTATION.md](./API_DOCUMENTATION.md)** for complete documentation including:
 
-1. Cloudflare Workers AI with the binding name "AI"
-2. Cloudflare Vectorize with the binding name "VECTORIZE"
+- Authentication
+- All endpoints and parameters
+- Filtering (date ranges, document IDs)
+- Response schemas
+- Code examples (curl, Python)
+- Query tips
 
-Example wrangler.jsonc configuration:
+## API Endpoints
 
-```jsonc
-{
-  "name": "vector-search-worker",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-02-11",
-  "compatibility_flags": ["nodejs_compat"],
-  "ai": {
-    "binding": "AI"
-  },
-  "vectorize": [
-    {
-      "binding": "VECTORIZE",
-      "index_name": "files-1"
-    }
-  ],
-  "observability": {
-    "enabled": true
-  }
-}
-```
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/search` | POST | Semantic search |
+| `/api/document/{r2Key}` | GET | Fetch full document |
+| `/api/health` | GET | Health check |
+| `/api/help` | GET | API docs (JSON) |
 
-## Error Handling
+## Key Features
 
-The API will return appropriate error responses with descriptive messages when:
-- Required parameters are missing
-- Embedding generation fails
-- Vector database queries fail
-- Any other errors occur during processing
+- **Semantic Search** - Natural language queries using BGE embeddings
+- **Date Filtering** - Filter by year/month or exact date (YYYYMM or YYYYMMDD)
+- **Full Document Retrieval** - Get complete document text and metadata
+- **Multiple Queries** - Search multiple concepts in one request
 
-## Implementation Details
+## Document Sources
 
-- Uses the `@cf/baai/bge-base-en-v1.5` embedding model for query embedding generation
-- Processes multiple query terms in parallel for efficiency
-- Results are combined and sorted by similarity score
-- Duplicate results are filtered out by ID
-- Returns the top K most similar results across all queries 
-
-# Chunk Finder Service
-
-A Cloudflare Worker for finding and retrieving chunks of text from embedded documents.
-
-## API Reference
-
-### Find Similar Embeddings
-
-```
-POST /
-```
-
-Finds chunks of text similar to the provided query text.
-
-#### Request Body Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| queries | string or array of strings | The query text to search for similar chunks |
-| collection_id | string | The ID of the collection to search in |
-| topK | number (optional) | Number of results to return, default is 5 |
-| corpus | string (optional) | Filter by corpus (e.g., 'cia', 'frus', 'clinton') |
-| doc_id | string (optional) | Filter by specific document ID |
-| authored_start | string (optional) | Start date for filtering (YYYY-MM-DD format) |
-| authored_end | string (optional) | End date for filtering (YYYY-MM-DD format) |
-
-#### Supported Corpus Values
-
-- `cfpf`: Central Federal Policy Files (1.67M docs)
-- `cia`: CIA documents (440K docs)
-- `frus`: Foreign Relations of the United States (159K docs)
-- `un`: United Nations documents (93K docs)
-- `worldbank`: World Bank reports (68K docs)
-- `clinton`: Clinton administration documents (30K docs)
-- `nato`: NATO documents (23K docs)
-- `cabinet`: U.S. Cabinet meeting records (20K docs)
-- `cpdoc`: Brazilian historical archives (6K docs)
-- `kissinger`: Henry Kissinger's diplomatic work (2K docs)
-- `briefing`: Government briefing documents (924 docs)
-
-#### Example Request
-
-```json
-{
-  "queries": "Cold War diplomacy in Eastern Europe",
-  "collection_id": "history-lab-1",
-  "topK": 10,
-  "corpus": "cia",
-  "authored_start": "1965-01-01",
-  "authored_end": "1975-12-31"
-}
-```
-
-#### Example Response
-
-```json
-{
-  "status": "success",
-  "matches": [
-    {
-      "id": "chunk-123",
-      "text": "The Soviet Union's influence in Eastern Europe remained strong throughout the Cold War period...",
-      "score": 0.92,
-      "metadata": {
-        "corpus": "cia",
-        "doc_id": "doc-456",
-        "authored": 157680000,
-        "title": "Analysis of Eastern Bloc Politics"
-      }
-    },
-    // Additional matches...
-  ]
-}
-```
+~5 million documents from:
+- CIA declassified documents
+- State Department Central Foreign Policy Files
+- Foreign Relations of the United States (FRUS)
+- Presidential Daily Briefings
+- NATO, UN, World Bank archives
+- And more...
 
 ## Development
 
 ### Prerequisites
 
-- Node.js 18 or later
-- Wrangler CLI (`npm install -g wrangler`)
+- Node.js 18+
+- Wrangler CLI
 
-### Setup
+### Deploy
 
-1. Clone the repository
-2. Install dependencies: `npm install`
-3. Configure your environment variables in `wrangler.jsonc`
-
-### Deployment
-
+```bash
+wrangler deploy
 ```
-wrangler publish
-``` 
+
+### Set API Key
+
+```bash
+wrangler secret put API_SECRET_KEY_2
+```
+
+## Technical Stack
+
+- **Runtime:** Cloudflare Workers
+- **Embeddings:** `@cf/baai/bge-base-en-v1.5` (768 dimensions)
+- **Vector DB:** Cloudflare Vectorize
+- **Storage:** Cloudflare R2 + KV
